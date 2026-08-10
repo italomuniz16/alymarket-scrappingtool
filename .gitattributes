@@ -1,0 +1,5 @@
+# Fixtures de teste em ISO-8859-1 (latin-1) de propósito, para validar o parsing real
+# de encoding dos arquivos da Receita Federal / SIRENE. Nunca devem passar por
+# normalização de fim de linha (core.autocrlf) nem qualquer conversão de encoding —
+# isso corromperia justamente o que o teste valida.
+tests/fixtures/** -text
