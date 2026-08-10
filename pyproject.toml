@@ -50,7 +50,7 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["src"]
+known-first-party = ["src", "cli"]
 
 [tool.mypy]
 python_version = "3.12"
