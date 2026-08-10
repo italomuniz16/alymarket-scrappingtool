@@ -1,0 +1,19 @@
+# Copie .env.example para .env antes de usar (docker compose up / docker compose run test).
+services:
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: streamlit run src/dashboard/app.py --server.port=8501 --server.address=0.0.0.0
+
+  test:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: pytest

@@ -1,0 +1,31 @@
+# Dados (baixados/gerados — nunca versionar)
+data/raw/
+data/staging/
+data/warehouse/
+
+# Segredos
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Testes / cobertura / lint / typecheck
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
