@@ -28,6 +28,16 @@ dev = [
     "mypy>=1.10",
 ]
 
+[tool.poetry]
+# O Streamlit Cloud detecta este pyproject.toml e roda `poetry install`. Sem isto,
+# o Poetry tenta instalar "alymarket" como pacote e falha ("No file/folder found
+# for package alymarket") porque o layout real é `src/` (ver
+# [tool.setuptools.packages.find] abaixo), não um pacote `alymarket/`. Com
+# package-mode = false, o Poetry só resolve/instala as dependências de [project]
+# (suporte PEP 621) e não tenta empacotar/instalar o próprio projeto — os imports
+# de `src/` continuam funcionando via `streamlit_app.py` na raiz (ver lá).
+package-mode = false
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
