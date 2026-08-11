@@ -17,6 +17,7 @@ from streamlit.testing.v1 import AppTest
 
 from src.dashboard.data import DEMO_LABEL
 from src.etl.transform import CANONICAL_PARQUET_SCHEMA, activate_version, new_version_dir
+from src.scheduler.state import mark_processed
 
 APP_PATH = str(Path(__file__).parent.parent / "src" / "dashboard" / "app.py")
 
@@ -63,6 +64,7 @@ def _configured_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, populate
     monkeypatch.setenv("SUPPRESSION_LIST_PATH", str(tmp_path / "nao-existe-supressao.csv"))
     monkeypatch.setenv("EXPORTS_DIR", str(tmp_path / "exports"))
     monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "audit.parquet"))
+    monkeypatch.setenv("SCHEDULER_STATE_PATH", str(tmp_path / "scheduler_state.json"))
     return warehouse_dir
 
 
@@ -77,6 +79,21 @@ class TestNoActiveVersion:
 
         assert not at.exception
         assert any("Nenhuma versão de" in str(e.value) for e in at.error)
+
+    def test_scheduler_panel_still_renders(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """O painel do scheduler ajuda a explicar POR QUE não há dados ainda --
+        precisa aparecer mesmo sem versão ativa de `leads`."""
+        _configured_env(monkeypatch, tmp_path, populated=False)
+
+        at = AppTest.from_file(APP_PATH)
+        at.run(timeout=30)
+
+        assert not at.exception
+        metrics = {m.label: m.value for m in at.metric}
+        assert metrics["BR_RECEITA"] == "nunca rodou"
+        assert metrics["FR_SIRENE"] == "nunca rodou"
 
 
 class TestHappyPath:
@@ -180,3 +197,34 @@ class TestDemoMode:
 
         assert metrics_off["TAM (tamanho do mercado endereçável)"] == "1"
         assert metrics_on["TAM (tamanho do mercado endereçável)"] == "2"
+
+
+class TestSchedulerPanel:
+    def test_shows_never_run_when_state_is_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _configured_env(monkeypatch, tmp_path, populated=True)
+
+        at = AppTest.from_file(APP_PATH)
+        at.run(timeout=30)
+
+        metrics = {m.label: m.value for m in at.metric}
+        assert metrics["BR_RECEITA"] == "nunca rodou"
+        assert metrics["FR_SIRENE"] == "nunca rodou"
+        captions = [c.value for c in at.caption]
+        assert any("—" in c for c in captions if "Última execução" in c)
+
+    def test_shows_last_competencia_when_processed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _configured_env(monkeypatch, tmp_path, populated=True)
+        mark_processed("BR_RECEITA", "2026-08", path=tmp_path / "scheduler_state.json")
+
+        at = AppTest.from_file(APP_PATH)
+        at.run(timeout=30)
+
+        metrics = {m.label: m.value for m in at.metric}
+        assert metrics["BR_RECEITA"] == "2026-08"
+        assert metrics["FR_SIRENE"] == "nunca rodou"
+        captions = [c.value for c in at.caption]
+        assert any("Última execução: 20" in c for c in captions)  # timestamp real, não "—"

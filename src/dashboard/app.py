@@ -32,8 +32,10 @@ from src.dashboard.data import (
     compute_compliance_panel,
     run_export,
     run_preview,
+    scheduler_status_rows,
     sync_leads_view,
 )
+from src.scheduler.state import DEFAULT_STATE_PATH
 from src.segmentation.filters import ICPCriteria
 from src.segmentation.suppression import SuppressionList, load_suppression_list
 
@@ -43,6 +45,7 @@ SUPPRESSION_LIST_PATH = Path(
 )
 EXPORT_DIR = Path(os.environ.get("EXPORTS_DIR", "./data/exports"))
 AUDIT_LOG_PATH = Path(os.environ.get("AUDIT_LOG_PATH", "./data/warehouse/audit_log.parquet"))
+SCHEDULER_STATE_PATH = Path(os.environ.get("SCHEDULER_STATE_PATH", str(DEFAULT_STATE_PATH)))
 
 SITUACOES = ("", "ATIVA", "BAIXADA", "SUSPENSA", "INAPTA", "NULA")
 
@@ -91,6 +94,25 @@ def _sidebar_filters() -> tuple[ICPCriteria, bool, int]:
         com_email=com_email,
     )
     return criteria, demo_mode, limit
+
+
+def _format_timestamp(value: str | None) -> str:
+    """`"2026-08-05T03:00:12.345678+00:00"` -> `"2026-08-05 03:00:12"` (mais legível
+    no painel; `None` vira `"—"`)."""
+    if not value:
+        return "—"
+    return value[:19].replace("T", " ")
+
+
+def _render_scheduler_panel() -> None:
+    st.subheader("Scheduler — última rodada por fonte")
+    rows = scheduler_status_rows(SCHEDULER_STATE_PATH)
+
+    cols = st.columns(len(rows))
+    for col, row in zip(cols, rows, strict=True):
+        with col:
+            st.metric(row["fonte"], row["ultima_competencia"] or "nunca rodou")
+            st.caption(f"Última execução: {_format_timestamp(row['ultima_execucao'])}")
 
 
 def _render_preview_and_tam(
@@ -179,6 +201,9 @@ def main() -> None:
 
     if demo_mode:
         st.warning(f"⚠️ {DEMO_LABEL} — os resultados abaixo podem incluir dados fictícios.")
+
+    _render_scheduler_panel()
+    st.divider()
 
     if not sync_leads_view(con, WAREHOUSE_DIR):
         st.error(

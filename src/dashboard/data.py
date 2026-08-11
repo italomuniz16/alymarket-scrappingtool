@@ -21,8 +21,10 @@ from typing import Any
 
 import duckdb
 
+from src.etl.canonical import FONTE_BR_RECEITA, FONTE_FR_SIRENE
 from src.etl.transform import get_active_leads_dir
 from src.export.exporters import ExportResult, export_csv, export_xlsx
+from src.scheduler.state import DEFAULT_STATE_PATH, load_state
 from src.segmentation.filters import (
     FilterClause,
     ICPCriteria,
@@ -236,6 +238,36 @@ def criteria_to_filtros_dict(criteria: ICPCriteria) -> dict[str, Any]:
     """Converte `criteria` num dict simples (só campos preenchidos), pro `audit_log`
     registrar quais filtros geraram a exportação."""
     return {k: v for k, v in dataclasses.asdict(criteria).items() if v is not None}
+
+
+# -- Painel do scheduler --------------------------------------------------------
+
+# Fontes conhecidas do scheduler (ver `src/scheduler/pipelines.py`) -- mostradas
+# sempre no painel, mesmo as que nunca rodaram ainda (mais informativo que omitir
+# silenciosamente uma fonte sem estado).
+KNOWN_FONTES: tuple[str, ...] = (FONTE_BR_RECEITA, FONTE_FR_SIRENE)
+
+
+def scheduler_status_rows(state_path: Path | str = DEFAULT_STATE_PATH) -> list[dict[str, Any]]:
+    """Uma linha por fonte conhecida (`KNOWN_FONTES`) com a última competência
+    processada com sucesso e quando (ver `scheduler/state.py`) -- alimenta o painel
+    "última rodada por fonte" do dashboard.
+
+    Uma fonte que ainda nunca rodou aparece com `ultima_competencia`/
+    `ultima_execucao` como `None`, não fica ausente da lista.
+    """
+    state = load_state(state_path)
+    rows: list[dict[str, Any]] = []
+    for fonte in KNOWN_FONTES:
+        source_state = state.get(fonte)
+        rows.append(
+            {
+                "fonte": fonte,
+                "ultima_competencia": source_state.last_competencia if source_state else None,
+                "ultima_execucao": source_state.last_run_at if source_state else None,
+            }
+        )
+    return rows
 
 
 def run_export(

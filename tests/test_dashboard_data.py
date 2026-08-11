@@ -13,6 +13,7 @@ import polars as pl
 import pytest
 
 from src.dashboard.data import (
+    KNOWN_FONTES,
     DemoExportBlockedError,
     chart_counts_by_atividade,
     chart_counts_by_regiao,
@@ -20,9 +21,11 @@ from src.dashboard.data import (
     criteria_to_filtros_dict,
     run_export,
     run_preview,
+    scheduler_status_rows,
     sync_leads_view,
 )
 from src.etl.transform import CANONICAL_PARQUET_SCHEMA, activate_version, new_version_dir
+from src.scheduler.state import mark_processed
 from src.segmentation.filters import ICPCriteria
 from src.segmentation.suppression import SuppressionList
 
@@ -238,3 +241,44 @@ class TestRunExport:
         )
         assert dest.exists()
         assert result.n_exported == 2  # ids 1 e 3 (regiao SP, exclui o synthetic)
+
+
+class TestSchedulerStatusRows:
+    def test_missing_state_file_shows_every_known_fonte_as_never_run(self, tmp_path: Path) -> None:
+        rows = scheduler_status_rows(tmp_path / "nao-existe.json")
+
+        assert [row["fonte"] for row in rows] == list(KNOWN_FONTES)
+        assert all(row["ultima_competencia"] is None for row in rows)
+        assert all(row["ultima_execucao"] is None for row in rows)
+
+    def test_reflects_processed_fonte(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "state.json"
+        mark_processed("BR_RECEITA", "2026-08", path=state_path)
+
+        rows = {row["fonte"]: row for row in scheduler_status_rows(state_path)}
+
+        assert rows["BR_RECEITA"]["ultima_competencia"] == "2026-08"
+        assert rows["BR_RECEITA"]["ultima_execucao"] is not None
+        # FR_SIRENE nunca rodou nesta base de estado -- continua presente, mas vazio.
+        assert rows["FR_SIRENE"]["ultima_competencia"] is None
+
+    def test_reflects_both_fontes_independently(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "state.json"
+        mark_processed("BR_RECEITA", "2026-08", path=state_path)
+        mark_processed("FR_SIRENE", "2026-08-01", path=state_path)
+
+        rows = {row["fonte"]: row for row in scheduler_status_rows(state_path)}
+
+        assert rows["BR_RECEITA"]["ultima_competencia"] == "2026-08"
+        assert rows["FR_SIRENE"]["ultima_competencia"] == "2026-08-01"
+
+    def test_row_order_matches_known_fontes(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "state.json"
+        # Registrado fora de ordem de propósito -- a ordem das linhas não deve
+        # depender da ordem em que as fontes foram processadas.
+        mark_processed("FR_SIRENE", "2026-08-01", path=state_path)
+        mark_processed("BR_RECEITA", "2026-08", path=state_path)
+
+        rows = scheduler_status_rows(state_path)
+
+        assert [row["fonte"] for row in rows] == list(KNOWN_FONTES)
