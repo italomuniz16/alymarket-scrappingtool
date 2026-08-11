@@ -22,7 +22,7 @@ import json
 import logging
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +144,7 @@ class EnrichmentClient:
         retry_wait_seconds: float = 2.0,
         cache_path: Path | str = DEFAULT_CACHE_PATH,
         cache_ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS,
+        extra_headers: Mapping[str, str] | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         """
@@ -157,12 +158,19 @@ class EnrichmentClient:
                 desativa a espera (usado nos testes).
             cache_path: onde persistir o cache (SQLite).
             cache_ttl_seconds: por quanto tempo uma resposta em cache é válida.
+            extra_headers: headers adicionais enviados em todo request (ex.:
+                `{"Authorization": "Bearer ..."}` pra uma API autenticada como a
+                Sirene do INSEE — ver `ingestion/fr_sirene/api_client.py`). `None`
+                (default) não adiciona nenhum.
             transport: transporte httpx alternativo (ex.: `httpx.MockTransport` em
                 testes). `None` usa a rede real.
         """
+        headers = {"User-Agent": user_agent}
+        if extra_headers:
+            headers.update(extra_headers)
         self._client = httpx.Client(
             transport=transport,
-            headers={"User-Agent": user_agent},
+            headers=headers,
             timeout=timeout_seconds,
             follow_redirects=True,
         )
