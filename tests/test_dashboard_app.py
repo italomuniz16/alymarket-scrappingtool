@@ -69,7 +69,20 @@ def _configured_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, populate
 
 
 class TestNoActiveVersion:
-    def test_shows_error_without_crashing(
+    def test_shows_guidance_without_crashing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Sem versão ativa, a página orienta pro painel "Coletar leads" (`st.info`,
+        não mais `st.error` -- agora há uma ação concreta na própria página)."""
+        _configured_env(monkeypatch, tmp_path, populated=False)
+
+        at = AppTest.from_file(APP_PATH)
+        at.run(timeout=30)
+
+        assert not at.exception
+        assert any("Nenhuma versão de" in str(i.value) for i in at.info)
+
+    def test_ingest_panel_expanded_when_no_data(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _configured_env(monkeypatch, tmp_path, populated=False)
@@ -78,7 +91,8 @@ class TestNoActiveVersion:
         at.run(timeout=30)
 
         assert not at.exception
-        assert any("Nenhuma versão de" in str(e.value) for e in at.error)
+        collect_buttons = [b for b in at.button if b.label == "Coletar leads"]
+        assert len(collect_buttons) == 1
 
     def test_scheduler_panel_still_renders(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -140,7 +154,8 @@ class TestHappyPath:
 
         at = AppTest.from_file(APP_PATH)
         at.run(timeout=30)
-        at.button[0].click().run(timeout=30)
+        export_button = next(b for b in at.button if b.label == "Exportar")
+        export_button.click().run(timeout=30)
 
         assert not at.exception
         assert len(at.success) == 1

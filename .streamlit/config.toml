@@ -1,0 +1,12 @@
+# Tema visual do dashboard (ver src/dashboard/app.py: mesmos tokens de cor usados
+# aqui e no CSS injetado, pra não ter dois sistemas de cor coexistindo).
+[theme]
+base = "light"
+primaryColor = "#2a78d6"
+backgroundColor = "#f9f9f7"
+secondaryBackgroundColor = "#fcfcfb"
+textColor = "#0b0b0b"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false

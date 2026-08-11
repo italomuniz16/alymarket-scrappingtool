@@ -12,6 +12,7 @@ import duckdb
 import polars as pl
 import pytest
 
+import src.dashboard.data as dashboard_data
 from src.dashboard.data import (
     KNOWN_FONTES,
     DemoExportBlockedError,
@@ -20,11 +21,18 @@ from src.dashboard.data import (
     compute_compliance_panel,
     criteria_to_filtros_dict,
     run_export,
+    run_export_one,
+    run_ingest_opencnpj,
     run_preview,
     scheduler_status_rows,
     sync_leads_view,
 )
-from src.etl.transform import CANONICAL_PARQUET_SCHEMA, activate_version, new_version_dir
+from src.etl.transform import (
+    CANONICAL_PARQUET_SCHEMA,
+    PipelineResult,
+    activate_version,
+    new_version_dir,
+)
 from src.scheduler.state import mark_processed
 from src.segmentation.filters import ICPCriteria
 from src.segmentation.suppression import SuppressionList
@@ -241,6 +249,122 @@ class TestRunExport:
         )
         assert dest.exists()
         assert result.n_exported == 2  # ids 1 e 3 (regiao SP, exclui o synthetic)
+
+
+class TestRunExportOne:
+    def test_raises_when_demo_true(self, leads_con: Con, tmp_path: Path) -> None:
+        with pytest.raises(DemoExportBlockedError):
+            run_export_one(
+                leads_con,
+                ICPCriteria(),
+                id_estab="1",
+                suppression=SuppressionList(),
+                dest=tmp_path / "out.csv",
+                formato="csv",
+                demo=True,
+            )
+        assert not (tmp_path / "out.csv").exists()
+
+    def test_raises_on_unknown_formato(self, leads_con: Con, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="Formato"):
+            run_export_one(
+                leads_con,
+                ICPCriteria(),
+                id_estab="1",
+                suppression=SuppressionList(),
+                dest=tmp_path / "out.pdf",
+                formato="pdf",
+                demo=False,
+            )
+
+    def test_exports_only_the_selected_lead(self, leads_con: Con, tmp_path: Path) -> None:
+        dest = tmp_path / "out.csv"
+        result = run_export_one(
+            leads_con,
+            ICPCriteria(),
+            id_estab="2",
+            suppression=SuppressionList(),
+            dest=dest,
+            formato="csv",
+            demo=False,
+            audit_log_path=tmp_path / "audit.parquet",
+        )
+
+        assert result.n_exported == 1
+        assert dest.read_text(encoding="utf-8").count("\n") == 2  # cabeçalho + 1 linha
+
+    def test_raises_when_id_estab_not_under_current_criteria(
+        self, leads_con: Con, tmp_path: Path
+    ) -> None:
+        """id_estab="2" é regiao=RJ; sob o filtro regiao=SP não aparece."""
+        with pytest.raises(ValueError, match="não encontrado"):
+            run_export_one(
+                leads_con,
+                ICPCriteria(regiao="SP"),
+                id_estab="2",
+                suppression=SuppressionList(),
+                dest=tmp_path / "out.csv",
+                formato="csv",
+                demo=False,
+            )
+
+    def test_synthetic_lead_is_never_exportable_even_by_id(
+        self, leads_con: Con, tmp_path: Path
+    ) -> None:
+        """id_estab="4" é is_synthetic=True -- exclusão hard, nem por id_estab
+        explícito passa (mesma garantia de build_export_query, ver CLAUDE.md)."""
+        with pytest.raises(ValueError, match="não encontrado"):
+            run_export_one(
+                leads_con,
+                ICPCriteria(),
+                id_estab="4",
+                suppression=SuppressionList(),
+                dest=tmp_path / "out.csv",
+                formato="csv",
+                demo=False,
+            )
+
+    def test_suppressed_lead_exports_zero_rows(self, leads_con: Con, tmp_path: Path) -> None:
+        """Diferente do id_estab inexistente (ValueError): um lead opt-out É
+        encontrado sob os critérios, mas o portão de supressão (dentro de
+        export_csv) o corta -- resultado válido com n_exported=0, não erro."""
+        suppression = SuppressionList(ids_estab=frozenset({"1"}))
+        dest = tmp_path / "out.csv"
+
+        result = run_export_one(
+            leads_con,
+            ICPCriteria(),
+            id_estab="1",
+            suppression=suppression,
+            dest=dest,
+            formato="csv",
+            demo=False,
+        )
+
+        assert result.n_exported == 0
+
+
+class TestRunIngestOpencnpj:
+    def test_delegates_to_collect_opencnpj_leads(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[Path, int]] = []
+
+        def fake_collect(warehouse_dir: Path, *, n: int) -> PipelineResult:
+            calls.append((warehouse_dir, n))
+            return PipelineResult(
+                version_dir=warehouse_dir / "versions" / "v1",
+                materialize_result=None,  # type: ignore[arg-type]
+                quality_report=None,  # type: ignore[arg-type]
+                activated=True,
+            )
+
+        monkeypatch.setattr(dashboard_data, "collect_opencnpj_leads", fake_collect)
+
+        result = run_ingest_opencnpj(tmp_path / "warehouse", n=25)
+
+        assert calls == [(tmp_path / "warehouse", 25)]
+        assert result.activated
 
 
 class TestSchedulerStatusRows:

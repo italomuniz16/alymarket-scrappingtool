@@ -12,7 +12,14 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.etl.loader import load_staging_directory, open_warehouse
-from src.etl.transform import run_transform_pipeline, run_transform_pipeline_fr
+from src.etl.transform import (
+    PipelineResult,
+    run_transform_pipeline,
+    run_transform_pipeline_fr,
+    run_transform_pipeline_opencnpj,
+)
+from src.ingestion.br_opencnpj.client import OpenCnpjClient
+from src.ingestion.br_opencnpj.discovery import SitemapCnpjDiscovery
 from src.ingestion.br_receita.downloader import ReceitaCNPJDownloader
 from src.ingestion.br_receita.extractor import extract_all
 from src.ingestion.fr_sirene.parser import detect_entity
@@ -135,3 +142,47 @@ def build_fr_sirene_pipeline(
         )
 
     return IngestionPipeline(fonte=FONTE_FR_SIRENE, check_latest=downloader.check_latest, run=run)
+
+
+def collect_opencnpj_leads(
+    warehouse_dir: Path = DEFAULT_WAREHOUSE_DIR,
+    *,
+    n: int,
+    discovery: SitemapCnpjDiscovery | None = None,
+    client: OpenCnpjClient | None = None,
+) -> PipelineResult:
+    """Coleta `n` leads reais via OpenCNPJ (descoberta por sitemap público +
+    busca na API aberta, ver `src/ingestion/br_opencnpj/`) e ativa uma nova versão
+    do warehouse -- fonte alternativa pra `pais=BR` enquanto
+    `build_br_receita_pipeline` (Receita Federal oficial) está desativado.
+
+    Sem conceito de "competência" (diferente de `build_br_receita_pipeline`/
+    `build_fr_sirene_pipeline`): cada chamada busca `n` CNPJs do sitemap, sem
+    idempotência entre rodadas -- não se encaixa no contrato `IngestionPipeline`
+    (`check_latest`/`run(competencia)`) do scheduler, então não retorna um
+    `IngestionPipeline`; é uma função simples, ponto único de orquestração pra não
+    duplicar a lógica entre `cli.py ingest` e o botão "Coletar leads" do dashboard.
+
+    Args:
+        warehouse_dir: destino final (tabela `leads`).
+        n: quantidade de CNPJs a buscar.
+        discovery/client: instâncias já configuradas (injete pra testes); default:
+            uma nova de cada, fechada ao final se não injetada.
+    """
+    owns_discovery = discovery is None
+    discovery = discovery or SitemapCnpjDiscovery()
+    try:
+        cnpjs = discovery.discover(n)
+    finally:
+        if owns_discovery:
+            discovery.close()
+
+    owns_client = client is None
+    client = client or OpenCnpjClient()
+    try:
+        records = list(client.fetch_many(cnpjs))
+    finally:
+        if owns_client:
+            client.close()
+
+    return run_transform_pipeline_opencnpj(records, warehouse_dir)

@@ -22,8 +22,9 @@ from typing import Any
 import duckdb
 
 from src.etl.canonical import FONTE_BR_RECEITA, FONTE_FR_SIRENE
-from src.etl.transform import get_active_leads_dir
+from src.etl.transform import PipelineResult, get_active_leads_dir
 from src.export.exporters import ExportResult, export_csv, export_xlsx
+from src.scheduler.pipelines import collect_opencnpj_leads
 from src.scheduler.state import DEFAULT_STATE_PATH, load_state
 from src.segmentation.filters import (
     FilterClause,
@@ -311,3 +312,69 @@ def run_export(
     if audit_log_path is not None:
         kwargs["audit_log_path"] = audit_log_path
     return exportar(rows, dest, **kwargs)
+
+
+def run_export_one(
+    con: duckdb.DuckDBPyConnection,
+    criteria: ICPCriteria,
+    *,
+    id_estab: str,
+    suppression: SuppressionList,
+    dest: Path,
+    formato: str,
+    demo: bool,
+    source: str = "leads",
+    usuario: str | None = None,
+    audit_log_path: Path | str | None = None,
+) -> ExportResult:
+    """Exporta um único lead (`id_estab`) dentre os que batem em `criteria` —
+    mesmas garantias de `run_export` (bloqueio em modo demo, portão de supressão
+    sempre aplicado dentro de `export_csv`/`export_xlsx`), usado pela ação
+    "Exportar esta empresa" de cada linha do preview do dashboard.
+
+    A consulta reaproveita `build_export_query` inteira (mesmas exclusões
+    obrigatórias que `run_export`) envolvida numa subquery com `id_estab = ?` — não
+    reimplementa o WHERE nem dá um jeito de pular as exclusões.
+
+    Raises:
+        DemoExportBlockedError: mesma regra de `run_export`.
+        ValueError: `formato` diferente de `"csv"`/`"xlsx"`, ou `id_estab` não
+            encontrado sob `criteria` (ex.: a linha saiu do conjunto por uma
+            mudança de filtro entre o preview e o clique — erro de uso, não de
+            sistema).
+    """
+    if demo:
+        raise DemoExportBlockedError(
+            "Exportação bloqueada: modo demonstração está ativo. "
+            "Desative o modo demonstração para exportar dados reais."
+        )
+    if formato not in {"csv", "xlsx"}:
+        raise ValueError(f"Formato de exportação desconhecido: {formato!r}")
+
+    built = build_export_query(criteria, source=source, order_by=None, limit=None)
+    wrapped_sql = f"SELECT * FROM ({built.select_sql}) AS _one WHERE id_estab = ?"
+    rows = _fetch_dicts(con, wrapped_sql, [*built.params, id_estab])
+    if not rows:
+        raise ValueError(f"Lead {id_estab!r} não encontrado sob os filtros atuais.")
+
+    filtros = criteria_to_filtros_dict(criteria)
+    filtros["id_estab"] = id_estab
+
+    exportar = export_csv if formato == "csv" else export_xlsx
+    kwargs: dict[str, Any] = {
+        "suppression": suppression,
+        "filtros": filtros,
+        "usuario": usuario,
+    }
+    if audit_log_path is not None:
+        kwargs["audit_log_path"] = audit_log_path
+    return exportar(rows, dest, **kwargs)
+
+
+def run_ingest_opencnpj(warehouse_dir: Path, *, n: int) -> PipelineResult:
+    """Coleta `n` leads reais via OpenCNPJ e ativa uma nova versão do warehouse
+    (ver `scheduler.pipelines.collect_opencnpj_leads`) — usado pelo botão "Coletar
+    leads" do dashboard, útil sobretudo no deploy hospedado (sem acesso ao
+    `cli.py ingest` local): permite popular o warehouse (efêmero nesse ambiente,
+    perdido a cada reinício/redeploy do container) direto pela interface."""
+    return collect_opencnpj_leads(warehouse_dir, n=n)

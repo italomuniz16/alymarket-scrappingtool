@@ -3,16 +3,26 @@ atividade, exportação (sempre via portão de supressão) e painel de complianc
 
 Rode com: `streamlit run src/dashboard/app.py`
 
-A lógica de dados (consultas, TAM, gráficos, compliance, exportação) fica em
+A lógica de dados (consultas, TAM, gráficos, compliance, exportação, coleta) fica em
 `dashboard/data.py`, testável sem depender do runtime do Streamlit — este arquivo só
 desenha os widgets e chama aquelas funções.
 
 ## Modo demonstração
 
 O seletor "Modo demonstração" mostra dados sintéticos (`is_synthetic=true`) junto dos
-reais, claramente rotulados (`DEMO_LABEL`) — mas **nunca** habilita o botão de
-exportar: exportação exige o modo desligado (ver `dashboard/data.run_export`, que
-recusa rodar com `demo=True` mesmo se chamada por engano).
+reais, claramente rotulados (`DEMO_LABEL`) — mas **nunca** habilita nenhum botão de
+exportar (nem o em massa, nem o de uma única empresa): exportação exige o modo
+desligado (ver `dashboard/data.run_export`/`run_export_one`, que recusam rodar com
+`demo=True` mesmo se chamadas por engano).
+
+## Coletar leads pela interface
+
+O painel "Coletar leads" roda a ingestão (fonte: OpenCNPJ — ver
+`src/ingestion/br_opencnpj/`) direto do servidor onde o Streamlit está rodando,
+sem precisar de acesso à `cli.py`. Importante no deploy hospedado: o warehouse
+populado assim é efêmero (perdido a cada reinício/redeploy do container), mas é o
+único jeito de o site publicado ter dados reais sem versionar dados no git (ver
+CLAUDE.md/.gitignore).
 """
 
 from __future__ import annotations
@@ -31,10 +41,13 @@ from src.dashboard.data import (
     chart_counts_by_regiao,
     compute_compliance_panel,
     run_export,
+    run_export_one,
+    run_ingest_opencnpj,
     run_preview,
     scheduler_status_rows,
     sync_leads_view,
 )
+from src.etl.transform import get_active_leads_dir
 from src.scheduler.state import DEFAULT_STATE_PATH
 from src.segmentation.filters import ICPCriteria
 from src.segmentation.suppression import SuppressionList, load_suppression_list
@@ -48,6 +61,71 @@ AUDIT_LOG_PATH = Path(os.environ.get("AUDIT_LOG_PATH", "./data/warehouse/audit_l
 SCHEDULER_STATE_PATH = Path(os.environ.get("SCHEDULER_STATE_PATH", str(DEFAULT_STATE_PATH)))
 
 SITUACOES = ("", "ATIVA", "BAIXADA", "SUSPENSA", "INAPTA", "NULA")
+
+# Tokens de cor/tipografia reutilizados no CSS abaixo e nos gráficos.
+_ACCENT_LIGHT = "#2a78d6"
+
+# Polimento visual leve: mantém a estrutura nativa do Streamlit (mesmas seções,
+# mesmos widgets), só aplica cor/tipografia/espaçamento consistentes via CSS —
+# cards para os `st.metric`, hierarquia de título mais clara. Tema fixo claro
+# (ver .streamlit/config.toml, base="light") de propósito: o Streamlit não expõe
+# um hook de tema pro CSS injetado reagir junto com o dele, então um dark mode só
+# parcial (cor de fundo escura, texto do Streamlit continua fixo escuro) rendeu
+# texto ilegível — mais seguro manter os dois (tema nativo + CSS) sempre em claro,
+# coerentes entre si, do que arriscar um dark mode inconsistente.
+_CUSTOM_CSS = f"""
+<style>
+:root {{
+    --am-surface: #fcfcfb;
+    --am-page: #f9f9f7;
+    --am-ink: #0b0b0b;
+    --am-ink-secondary: #52514e;
+    --am-border: rgba(11, 11, 11, 0.10);
+    --am-accent: {_ACCENT_LIGHT};
+}}
+
+.block-container {{
+    padding-top: 2rem;
+    max-width: 1200px;
+}}
+
+h1 {{
+    font-weight: 700 !important;
+    letter-spacing: -0.02em;
+}}
+h2, h3 {{
+    font-weight: 600 !important;
+    margin-top: 1.75rem !important;
+}}
+
+[data-testid="stMetric"] {{
+    background: var(--am-surface);
+    border: 1px solid var(--am-border);
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+}}
+[data-testid="stMetricLabel"] {{
+    color: var(--am-ink-secondary) !important;
+}}
+
+[data-testid="stExpander"], [data-testid="stVerticalBlockBorderWrapper"] {{
+    border-radius: 10px;
+}}
+
+hr {{
+    margin: 1.75rem 0 !important;
+    border-color: var(--am-border) !important;
+}}
+
+[data-testid="stSidebar"] {{
+    border-right: 1px solid var(--am-border);
+}}
+
+div[data-testid="stAlert"] {{
+    border-radius: 8px;
+}}
+</style>
+"""
 
 
 @st.cache_resource
@@ -115,8 +193,48 @@ def _render_scheduler_panel() -> None:
             st.caption(f"Última execução: {_format_timestamp(row['ultima_execucao'])}")
 
 
+def _render_ingest_panel(warehouse_dir: Path) -> None:
+    """Painel "Coletar leads": roda a ingestão via OpenCNPJ direto da interface —
+    ver docstring do módulo sobre por que isso importa no deploy hospedado."""
+    has_data = get_active_leads_dir(warehouse_dir) is not None
+
+    with st.expander("🔄 Coletar leads (fonte: OpenCNPJ)", expanded=not has_data):
+        st.caption(
+            "Busca empresas reais via sitemap público (cnpja.com) + API aberta e "
+            "gratuita do OpenCNPJ (sem autenticação, dados oficiais da Receita "
+            "Federal) — fonte alternativa enquanto o conector oficial da Receita "
+            "Federal (Dados Abertos CNPJ) está desativado."
+        )
+        col_n, col_btn = st.columns([2, 1])
+        n = col_n.number_input(
+            "Quantidade de CNPJs", min_value=1, max_value=500, value=40, step=10
+        )
+        col_btn.write("")
+        if col_btn.button("Coletar leads", type="primary", width="stretch"):
+            with st.spinner(f"Coletando até {int(n)} lead(s)... pode levar alguns minutos."):
+                try:
+                    result = run_ingest_opencnpj(warehouse_dir, n=int(n))
+                except Exception as exc:
+                    st.error(f"Falha ao coletar leads: {exc}")
+                    return
+
+            if result.activated:
+                st.success(
+                    f"{result.materialize_result.n_rows_written} lead(s) novo(s) coletado(s) "
+                    f"— {result.quality_report.n_rows} no total ativado(s)."
+                )
+                st.rerun()
+            else:
+                st.error(f"Validação de qualidade reprovada: {result.quality_report.failures}")
+
+
 def _render_preview_and_tam(
-    con: duckdb.DuckDBPyConnection, criteria: ICPCriteria, demo_mode: bool, limit: int
+    con: duckdb.DuckDBPyConnection,
+    criteria: ICPCriteria,
+    demo_mode: bool,
+    limit: int,
+    *,
+    suppression: SuppressionList,
 ) -> None:
     preview = run_preview(con, criteria, demo=demo_mode, limit=limit)
 
@@ -125,7 +243,56 @@ def _render_preview_and_tam(
     col_preview.metric("Linhas no preview", len(preview.rows))
 
     st.subheader("Preview")
-    st.dataframe(preview.rows, width="stretch")
+    st.caption("Selecione uma linha na tabela pra exportar só aquela empresa.")
+    event = st.dataframe(
+        preview.rows,
+        width="stretch",
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="preview_table",
+    )
+
+    selected_rows: list[int] = []
+    if isinstance(event, dict):
+        selected_rows = event.get("selection", {}).get("rows", [])
+    if not selected_rows:
+        return
+
+    selected = preview.rows[selected_rows[0]]
+    with st.container(border=True):
+        st.markdown(f"**Selecionada:** {selected['razao_social']} · `{selected['id_estab']}`")
+
+        if demo_mode:
+            st.caption("Exportação desabilitada em modo demonstração.")
+            return
+
+        col_fmt, col_btn = st.columns([2, 1])
+        formato_one = col_fmt.radio(
+            "Formato", ["csv", "xlsx"], horizontal=True, key="formato_one"
+        )
+        col_btn.write("")
+        if col_btn.button("Exportar esta empresa", key="export_one_btn", width="stretch"):
+            timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+            dest = EXPORT_DIR / f"lead_{selected['id_estab']}_{timestamp}.{formato_one}"
+            try:
+                result = run_export_one(
+                    con,
+                    criteria,
+                    id_estab=selected["id_estab"],
+                    suppression=suppression,
+                    dest=dest,
+                    formato=formato_one,
+                    demo=demo_mode,
+                    audit_log_path=AUDIT_LOG_PATH,
+                )
+            except (DemoExportBlockedError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                if result.n_exported == 0:
+                    st.warning("Empresa suprimida (opt-out/duplicata) — nada exportado.")
+                else:
+                    st.success(f"Exportado para `{result.path}`.")
 
 
 def _render_charts(con: duckdb.DuckDBPyConnection, criteria: ICPCriteria, demo_mode: bool) -> None:
@@ -133,10 +300,12 @@ def _render_charts(con: duckdb.DuckDBPyConnection, criteria: ICPCriteria, demo_m
     chart_col1, chart_col2 = st.columns(2)
     with chart_col1:
         st.caption("Por região")
-        st.bar_chart(chart_counts_by_regiao(con, criteria, demo=demo_mode))
+        st.bar_chart(chart_counts_by_regiao(con, criteria, demo=demo_mode), color=_ACCENT_LIGHT)
     with chart_col2:
         st.caption("Por atividade")
-        st.bar_chart(chart_counts_by_atividade(con, criteria, demo=demo_mode))
+        st.bar_chart(
+            chart_counts_by_atividade(con, criteria, demo=demo_mode), color=_ACCENT_LIGHT
+        )
 
 
 def _render_compliance_panel(
@@ -194,6 +363,7 @@ def _render_export(
 
 def main() -> None:
     st.set_page_config(page_title="alymarket — leads", layout="wide")
+    st.markdown(_CUSTOM_CSS, unsafe_allow_html=True)
     st.title("alymarket — geração de leads B2B")
 
     con = get_connection()
@@ -204,18 +374,20 @@ def main() -> None:
 
     _render_scheduler_panel()
     st.divider()
+    _render_ingest_panel(WAREHOUSE_DIR)
+    st.divider()
 
     if not sync_leads_view(con, WAREHOUSE_DIR):
-        st.error(
-            f"Nenhuma versão de `leads` está ativa em `{WAREHOUSE_DIR}`. "
-            "Rode o pipeline de transform (`etl/transform.run_transform_pipeline`) primeiro."
+        st.info(
+            "Nenhuma versão de `leads` está ativa ainda. Use o painel "
+            "\"🔄 Coletar leads\" acima pra popular o warehouse."
         )
         return
 
-    _render_preview_and_tam(con, criteria, demo_mode, limit)
-    _render_charts(con, criteria, demo_mode)
-
     suppression = get_suppression_list(str(SUPPRESSION_LIST_PATH))
+
+    _render_preview_and_tam(con, criteria, demo_mode, limit, suppression=suppression)
+    _render_charts(con, criteria, demo_mode)
     _render_compliance_panel(con, criteria, suppression)
     _render_export(con, criteria, suppression, demo_mode)
 
