@@ -24,8 +24,10 @@ import logging
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
+from src.compliance.audit_log import DEFAULT_AUDIT_LOG_PATH
 from src.enrichment.client import EnrichmentClient, enrich_leads
 from src.ingestion.base import CanonicalLead
 
@@ -111,17 +113,29 @@ def make_brasilapi_client(**overrides: Any) -> EnrichmentClient:
 
 
 def enrich_br_leads(
-    client: EnrichmentClient, cnpjs: Sequence[str], *, max_batch_size: int = 1000
+    client: EnrichmentClient,
+    cnpjs: Sequence[str],
+    *,
+    max_batch_size: int = 1000,
+    audit_log_path: Path | str = DEFAULT_AUDIT_LOG_PATH,
+    usuario: str | None = None,
 ) -> dict[str, dict[str, Any] | None]:
     """Enriquece um SUBCONJUNTO explícito de leads BR via BrasilAPI, por CNPJ
-    completo (14 dígitos) — nunca a base inteira (ver `enrichment.client.enrich_leads`).
+    completo (14 dígitos) — nunca a base inteira (ver `enrichment.client.enrich_leads`,
+    que também registra o evento de auditoria — `audit_log_path`/`usuario` só passam
+    adiante).
 
     Returns:
         `{cnpj: atualizacao_canonica}` — `None` se aquele CNPJ não foi encontrado ou
         a requisição falhou (não interrompe os demais).
     """
     raw = enrich_leads(
-        client, cnpjs, url_template=BRASILAPI_URL_TEMPLATE, max_batch_size=max_batch_size
+        client,
+        cnpjs,
+        url_template=BRASILAPI_URL_TEMPLATE,
+        max_batch_size=max_batch_size,
+        audit_log_path=audit_log_path,
+        usuario=usuario,
     )
     return {
         cnpj: (map_brasilapi_response(data) if data is not None else None)
@@ -195,10 +209,17 @@ def make_recherche_entreprises_client(**overrides: Any) -> EnrichmentClient:
 
 
 def enrich_fr_leads(
-    client: EnrichmentClient, sirens: Sequence[str], *, max_batch_size: int = 1000
+    client: EnrichmentClient,
+    sirens: Sequence[str],
+    *,
+    max_batch_size: int = 1000,
+    audit_log_path: Path | str = DEFAULT_AUDIT_LOG_PATH,
+    usuario: str | None = None,
 ) -> dict[str, dict[str, Any] | None]:
     """Enriquece um SUBCONJUNTO explícito de leads FR via API Recherche d'Entreprises,
-    por SIREN (9 dígitos) — nunca a base inteira.
+    por SIREN (9 dígitos) — nunca a base inteira (ver `enrichment.client.enrich_leads`,
+    que também registra o evento de auditoria — `audit_log_path`/`usuario` só passam
+    adiante).
 
     Returns:
         `{siren: atualizacao_canonica}` — `None` se aquele SIREN não foi encontrado
@@ -209,6 +230,8 @@ def enrich_fr_leads(
         sirens,
         url_template=RECHERCHE_ENTREPRISES_URL_TEMPLATE,
         max_batch_size=max_batch_size,
+        audit_log_path=audit_log_path,
+        usuario=usuario,
     )
     return {
         siren: (map_recherche_entreprises_response(data) if data is not None else None)

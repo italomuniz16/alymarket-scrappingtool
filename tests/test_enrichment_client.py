@@ -5,6 +5,7 @@ backoff/retry, e respeito ao rate limit -- sem nenhuma chamada de rede real.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import httpx
 import pytest
 
 import src.enrichment.client as client_module
+from src.compliance.audit_log import read_audit_log
 from src.enrichment.client import (
     DEFAULT_USER_AGENT,
     EnrichmentCache,
@@ -202,8 +204,9 @@ class TestEnrichmentClientRetry:
     def test_gives_up_after_max_attempts(self, tmp_path: Path) -> None:
         url = "https://api.test/cnpj/1"
         server = FakeApiServer(responses={url: [(500, {})]})
-        with _make_client(server, tmp_path, max_attempts=3) as client, pytest.raises(
-            httpx.HTTPStatusError
+        with (
+            _make_client(server, tmp_path, max_attempts=3) as client,
+            pytest.raises(httpx.HTTPStatusError),
         ):
             client.get_json(url)
 
@@ -286,7 +289,10 @@ class TestEnrichLeads:
         )
         with _make_client(server, tmp_path) as client:
             resultado = enrich_leads(
-                client, ["AAA", "BBB"], url_template="https://api.test/cnpj/{id}"
+                client,
+                ["AAA", "BBB"],
+                url_template="https://api.test/cnpj/{id}",
+                audit_log_path=tmp_path / "audit.parquet",
             )
 
         assert resultado == {
@@ -323,8 +329,57 @@ class TestEnrichLeads:
         )
         with _make_client(server, tmp_path, max_attempts=1) as client:
             resultado = enrich_leads(
-                client, ["OK", "RUIM"], url_template="https://api.test/cnpj/{id}"
+                client,
+                ["OK", "RUIM"],
+                url_template="https://api.test/cnpj/{id}",
+                audit_log_path=tmp_path / "audit.parquet",
             )
 
         assert resultado["OK"] == {"razao_social": "OK LTDA"}
         assert resultado["RUIM"] is None
+
+
+class TestEnrichLeadsAudit:
+    """`enrich_leads` é o único ponto de entrada de enriquecimento (ver docstring do
+    módulo) -- por isso é aqui, e só aqui, que o evento de auditoria é registrado."""
+
+    def test_records_audit_event_with_found_count(self, tmp_path: Path) -> None:
+        server = FakeApiServer(
+            responses={
+                "https://api.test/cnpj/OK": [(200, {"razao_social": "OK LTDA"})],
+                "https://api.test/cnpj/RUIM": [(500, {})],
+            }
+        )
+        audit_log_path = tmp_path / "audit.parquet"
+        with _make_client(server, tmp_path, max_attempts=1) as client:
+            enrich_leads(
+                client,
+                ["OK", "RUIM"],
+                url_template="https://api.test/cnpj/{id}",
+                audit_log_path=audit_log_path,
+                usuario="italo",
+            )
+
+        df = read_audit_log(audit_log_path)
+        assert df.height == 1
+        row = df.to_dicts()[0]
+        assert row["operacao"] == "enrich_leads"
+        assert row["usuario"] == "italo"
+        # Só 1 dos 2 identificadores foi de fato encontrado (o outro deu 500).
+        assert row["n_registros"] == 1
+
+        filtros = json.loads(row["filtros"])
+        assert filtros["quantidade_solicitada"] == 2
+        assert filtros["url_template"] == "https://api.test/cnpj/{id}"
+
+    def test_invalid_usage_does_not_record_an_event(self, tmp_path: Path) -> None:
+        """`EnrichmentError` (lista vazia/lote grande demais) acontece antes de
+        qualquer requisição -- não deve gerar evento de auditoria."""
+        server = FakeApiServer(responses={})
+        audit_log_path = tmp_path / "audit.parquet"
+        with _make_client(server, tmp_path) as client, pytest.raises(EnrichmentError):
+            enrich_leads(
+                client, [], url_template="https://api.test/cnpj/{id}", audit_log_path=audit_log_path
+            )
+
+        assert read_audit_log(audit_log_path).height == 0

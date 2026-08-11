@@ -4,8 +4,8 @@ timeout, cache local persistido com TTL (evita rechamar o mesmo CNPJ/SIREN entre
 execuções), User-Agent identificado.
 
 Este módulo é o cliente HTTP genérico; a lógica específica de cada provedor
-(BrasilAPI, CNPJá, API Sirene) fica em `enrichment/providers.py` (ainda não
-implementado), que constrói sobre `EnrichmentClient`.
+(BrasilAPI, API Recherche d'Entreprises) fica em `enrichment/providers.py`, que
+constrói sobre `EnrichmentClient`.
 
 ## Nunca sobre a base inteira
 
@@ -14,6 +14,13 @@ resultado de uma exportação já filtrada) — não existe, de propósito, nenh
 aqui que aceite "todos os leads" ou consulte o warehouse diretamente. `max_batch_size`
 (default 1000) é reforçado em código, não só documentação: passar mais identificadores
 do que isso levanta erro antes de fazer qualquer requisição.
+
+## Auditoria
+
+`enrich_leads` é o único ponto de entrada usado por todo `enrichment/providers.py`
+(BR e FR) — por isso é aqui, e só aqui, que cada tentativa de enriquecimento registra
+um evento em `compliance/audit_log.py` (operação sensível, ver CLAUDE.md), sempre,
+sem parâmetro pra pular essa etapa: mesma filosofia de `export/exporters.py`.
 """
 
 from __future__ import annotations
@@ -28,6 +35,8 @@ from typing import Any
 
 import httpx
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from src.compliance.audit_log import DEFAULT_AUDIT_LOG_PATH, new_event, record_event
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +240,8 @@ def enrich_leads(
     *,
     url_template: str,
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE,
+    audit_log_path: Path | str = DEFAULT_AUDIT_LOG_PATH,
+    usuario: str | None = None,
 ) -> dict[str, dict[str, Any] | None]:
     """Enriquece um SUBCONJUNTO explícito de identificadores (CNPJ/SIREN) — nunca a
     base inteira (ver docstring do módulo).
@@ -243,6 +254,10 @@ def enrich_leads(
             (ex.: `"https://brasilapi.com.br/api/cnpj/v1/{id}"`).
         max_batch_size: máximo de identificadores por chamada — reforçado em código
             (`EnrichmentError`), não só como recomendação.
+        audit_log_path: onde registrar o evento de auditoria (ver módulo
+            `compliance/audit_log.py`) — registrado sempre, sem parâmetro pra
+            desativar (operação sensível, ver CLAUDE.md).
+        usuario: quem disparou o enriquecimento; default: usuário do SO.
 
     Returns:
         `{identificador: resposta_json}`; `None` no lugar da resposta se aquele
@@ -250,7 +265,8 @@ def enrich_leads(
 
     Raises:
         EnrichmentError: se `identificadores` exceder `max_batch_size`, ou estiver
-            vazio.
+            vazio. Levantado ANTES de qualquer requisição/registro de auditoria —
+            uma tentativa rejeitada por uso inválido não gera evento.
     """
     if not identificadores:
         raise EnrichmentError("Nenhum identificador informado para enriquecer.")
@@ -268,5 +284,19 @@ def enrich_leads(
         except httpx.HTTPError as exc:
             logger.warning("Falha ao enriquecer %s: %s", identificador, exc)
             resultados[identificador] = None
+
+    n_encontrados = sum(1 for v in resultados.values() if v is not None)
+    record_event(
+        new_event(
+            "enrich_leads",
+            usuario=usuario,
+            filtros={
+                "url_template": url_template,
+                "quantidade_solicitada": len(identificadores),
+            },
+            n_registros=n_encontrados,
+        ),
+        audit_log_path,
+    )
 
     return resultados

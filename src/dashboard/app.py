@@ -42,6 +42,7 @@ SUPPRESSION_LIST_PATH = Path(
     os.environ.get("SUPPRESSION_LIST_PATH", "./data/warehouse/suppression_list.csv")
 )
 EXPORT_DIR = Path(os.environ.get("EXPORTS_DIR", "./data/exports"))
+AUDIT_LOG_PATH = Path(os.environ.get("AUDIT_LOG_PATH", "./data/warehouse/audit_log.parquet"))
 
 SITUACOES = ("", "ATIVA", "BAIXADA", "SUSPENSA", "INAPTA", "NULA")
 
@@ -161,6 +162,7 @@ def _render_export(
                 formato=formato,
                 demo=demo_mode,
                 usuario=usuario or None,
+                audit_log_path=AUDIT_LOG_PATH,
             )
         except DemoExportBlockedError as exc:
             st.error(str(exc))

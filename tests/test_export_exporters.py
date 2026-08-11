@@ -52,7 +52,9 @@ class TestSuppressionGateOnExportCsv:
         leads = [_lead(id_estab="ok"), _lead(id_estab="synth", is_synthetic=True)]
         dest = tmp_path / "out.csv"
 
-        result = export_csv(leads, dest, suppression=NO_SUPPRESSION)
+        result = export_csv(
+            leads, dest, suppression=NO_SUPPRESSION, audit_log_path=tmp_path / "audit.parquet"
+        )
 
         assert result.n_exported == 1
         with dest.open(encoding="utf-8", newline="") as f:
@@ -63,7 +65,9 @@ class TestSuppressionGateOnExportCsv:
         leads = [_lead(id_estab="ok"), _lead(id_estab="fr-restrito", flag_difusao_restrita=True)]
         dest = tmp_path / "out.csv"
 
-        result = export_csv(leads, dest, suppression=NO_SUPPRESSION)
+        result = export_csv(
+            leads, dest, suppression=NO_SUPPRESSION, audit_log_path=tmp_path / "audit.parquet"
+        )
 
         assert result.n_exported == 1
         with dest.open(encoding="utf-8", newline="") as f:
@@ -74,7 +78,9 @@ class TestSuppressionGateOnExportCsv:
         leads = [_lead(id_estab="A"), _lead(id_estab="A")]
         dest = tmp_path / "out.csv"
 
-        result = export_csv(leads, dest, suppression=NO_SUPPRESSION)
+        result = export_csv(
+            leads, dest, suppression=NO_SUPPRESSION, audit_log_path=tmp_path / "audit.parquet"
+        )
 
         assert result.n_exported == 1
 
@@ -86,7 +92,9 @@ class TestSuppressionGateOnExportCsv:
         suppression = SuppressionList(ids_estab=frozenset({"A"}))
         dest = tmp_path / "out.csv"
 
-        result = export_csv(leads, dest, suppression=suppression)
+        result = export_csv(
+            leads, dest, suppression=suppression, audit_log_path=tmp_path / "audit.parquet"
+        )
 
         assert result.n_exported == 1
         with dest.open(encoding="utf-8", newline="") as f:
@@ -105,7 +113,9 @@ class TestSuppressionGateOnExportCsv:
         suppression = SuppressionList(ids_estab=frozenset({"suprimido"}))
         dest = tmp_path / "out.csv"
 
-        result = export_csv(leads, dest, suppression=suppression)
+        result = export_csv(
+            leads, dest, suppression=suppression, audit_log_path=tmp_path / "audit.parquet"
+        )
 
         report = result.suppression_report
         assert report.n_in == 6
@@ -118,7 +128,9 @@ class TestSuppressionGateOnExportCsv:
 class TestExportCsvContent:
     def test_header_and_column_order(self, tmp_path: Path) -> None:
         dest = tmp_path / "out.csv"
-        export_csv([_lead()], dest, suppression=NO_SUPPRESSION)
+        export_csv(
+            [_lead()], dest, suppression=NO_SUPPRESSION, audit_log_path=tmp_path / "audit.parquet"
+        )
 
         with dest.open(encoding="utf-8", newline="") as f:
             header = next(csv.reader(f))
@@ -130,7 +142,12 @@ class TestExportCsvContent:
 
     def test_row_values(self, tmp_path: Path) -> None:
         dest = tmp_path / "out.csv"
-        export_csv([_lead(razao_social="ACME LTDA")], dest, suppression=NO_SUPPRESSION)
+        export_csv(
+            [_lead(razao_social="ACME LTDA")],
+            dest,
+            suppression=NO_SUPPRESSION,
+            audit_log_path=tmp_path / "audit.parquet",
+        )
 
         with dest.open(encoding="utf-8", newline="") as f:
             row = next(csv.DictReader(f))
@@ -139,7 +156,12 @@ class TestExportCsvContent:
 
     def test_empty_after_suppression_still_writes_header_only(self, tmp_path: Path) -> None:
         dest = tmp_path / "out.csv"
-        result = export_csv([_lead(is_synthetic=True)], dest, suppression=NO_SUPPRESSION)
+        result = export_csv(
+            [_lead(is_synthetic=True)],
+            dest,
+            suppression=NO_SUPPRESSION,
+            audit_log_path=tmp_path / "audit.parquet",
+        )
 
         assert result.n_exported == 0
         with dest.open(encoding="utf-8", newline="") as f:
@@ -148,13 +170,24 @@ class TestExportCsvContent:
 
     def test_no_columns_raises_export_error(self, tmp_path: Path) -> None:
         with pytest.raises(ExportError):
-            export_csv([_lead()], tmp_path / "out.csv", suppression=NO_SUPPRESSION, columns=[])
+            export_csv(
+                [_lead()],
+                tmp_path / "out.csv",
+                suppression=NO_SUPPRESSION,
+                columns=[],
+                audit_log_path=tmp_path / "audit.parquet",
+            )
 
 
 class TestExportXlsxContent:
     def test_header_and_rows(self, tmp_path: Path) -> None:
         dest = tmp_path / "out.xlsx"
-        export_xlsx([_lead(razao_social="ACME LTDA")], dest, suppression=NO_SUPPRESSION)
+        export_xlsx(
+            [_lead(razao_social="ACME LTDA")],
+            dest,
+            suppression=NO_SUPPRESSION,
+            audit_log_path=tmp_path / "audit.parquet",
+        )
 
         wb = load_workbook(dest)
         ws = wb.active
@@ -166,7 +199,9 @@ class TestExportXlsxContent:
         leads = [_lead(id_estab="ok"), _lead(id_estab="synth", is_synthetic=True)]
         dest = tmp_path / "out.xlsx"
 
-        result = export_xlsx(leads, dest, suppression=NO_SUPPRESSION)
+        result = export_xlsx(
+            leads, dest, suppression=NO_SUPPRESSION, audit_log_path=tmp_path / "audit.parquet"
+        )
 
         assert result.n_exported == 1
         wb = load_workbook(dest)

@@ -62,6 +62,7 @@ def _configured_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, populate
     monkeypatch.setenv("DATA_WAREHOUSE_DIR", str(warehouse_dir))
     monkeypatch.setenv("SUPPRESSION_LIST_PATH", str(tmp_path / "nao-existe-supressao.csv"))
     monkeypatch.setenv("EXPORTS_DIR", str(tmp_path / "exports"))
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "audit.parquet"))
     return warehouse_dir
 
 

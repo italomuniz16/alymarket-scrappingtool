@@ -309,7 +309,7 @@ class TestEnrichBrLeads:
             return httpx.Response(200, json=BRASILAPI_RESPONSE)
 
         with _mock_client(handler, tmp_path) as client:
-            result = enrich_br_leads(client, [cnpj])
+            result = enrich_br_leads(client, [cnpj], audit_log_path=tmp_path / "audit.parquet")
 
         assert result[cnpj] is not None
         assert result[cnpj]["razao_social"] == "PETROLEO BRASILEIRO S A PETROBRAS"
@@ -321,7 +321,7 @@ class TestEnrichBrLeads:
             return httpx.Response(404, json={"message": "not found"})
 
         with _mock_client(handler, tmp_path, max_attempts=1) as client:
-            result = enrich_br_leads(client, [cnpj])
+            result = enrich_br_leads(client, [cnpj], audit_log_path=tmp_path / "audit.parquet")
 
         assert result[cnpj] is None
 
@@ -336,7 +336,7 @@ class TestEnrichBrLeads:
             return httpx.Response(200, json=BRASILAPI_RESPONSE)
 
         with _mock_client(handler, tmp_path, max_attempts=5) as client:
-            result = enrich_br_leads(client, [cnpj])
+            result = enrich_br_leads(client, [cnpj], audit_log_path=tmp_path / "audit.parquet")
 
         assert len(calls) == 2
         assert result[cnpj] is not None
@@ -351,7 +351,7 @@ class TestEnrichFrLeads:
             return httpx.Response(200, json=RECHERCHE_ENTREPRISES_RESPONSE)
 
         with _mock_client(handler, tmp_path) as client:
-            result = enrich_fr_leads(client, [siren])
+            result = enrich_fr_leads(client, [siren], audit_log_path=tmp_path / "audit.parquet")
 
         assert result[siren] is not None
         assert result[siren]["razao_social"] == "CARREFOUR"
@@ -363,7 +363,7 @@ class TestEnrichFrLeads:
             return httpx.Response(200, json=RECHERCHE_ENTREPRISES_EMPTY_RESPONSE)
 
         with _mock_client(handler, tmp_path) as client:
-            result = enrich_fr_leads(client, [siren])
+            result = enrich_fr_leads(client, [siren], audit_log_path=tmp_path / "audit.parquet")
 
         assert result[siren] is None
 
@@ -377,7 +377,9 @@ class TestEnrichFrLeads:
             return httpx.Response(200, json=RECHERCHE_ENTREPRISES_EMPTY_RESPONSE)
 
         with _mock_client(handler, tmp_path) as client:
-            result = enrich_fr_leads(client, [found, not_found])
+            result = enrich_fr_leads(
+                client, [found, not_found], audit_log_path=tmp_path / "audit.parquet"
+            )
 
         assert result[found] is not None
         assert result[not_found] is None

@@ -4,6 +4,7 @@ ponta a ponta contra uma versão ativa pequena do warehouse.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from datetime import date
@@ -22,6 +23,7 @@ from cli import (
     parse_args,
     run_query_command,
 )
+from src.compliance.audit_log import read_audit_log
 from src.etl.transform import CANONICAL_PARQUET_SCHEMA, activate_version, new_version_dir
 
 
@@ -196,9 +198,16 @@ def _make_active_version(tmp_path: Path, rows: list[dict[str, object]]) -> Path:
     return warehouse_dir
 
 
+def _run_query(warehouse_dir: Path, filters: QueryFilters, tmp_path: Path) -> int:
+    """Wrapper que sempre isola o log de auditoria em `tmp_path` -- `query` registra
+    um evento sempre (ver `run_query_command`), então os testes não devem depender
+    do `AUDIT_LOG_PATH` default (que apontaria pro warehouse real do projeto)."""
+    return run_query_command(warehouse_dir, filters, audit_log_path=tmp_path / "audit.parquet")
+
+
 class TestRunQueryCommand:
     def test_no_active_version_returns_1(self, tmp_path: Path, capsys: Capsys) -> None:
-        exit_code = run_query_command(tmp_path / "empty-warehouse", QueryFilters())
+        exit_code = _run_query(tmp_path / "empty-warehouse", QueryFilters(), tmp_path)
         assert exit_code == 1
         assert "nenhuma versão ativa" in capsys.readouterr().err
 
@@ -214,7 +223,7 @@ class TestRunQueryCommand:
         ]
         warehouse_dir = _make_active_version(tmp_path, rows)
 
-        exit_code = run_query_command(warehouse_dir, QueryFilters())
+        exit_code = _run_query(warehouse_dir, QueryFilters(), tmp_path)
 
         assert exit_code == 0
         assert "Total: 3 lead(s)" in capsys.readouterr().out
@@ -227,7 +236,7 @@ class TestRunQueryCommand:
         ]
         warehouse_dir = _make_active_version(tmp_path, rows)
 
-        run_query_command(warehouse_dir, QueryFilters(situacao="ativa"))
+        _run_query(warehouse_dir, QueryFilters(situacao="ativa"), tmp_path)
 
         assert "Total: 2 lead(s)" in capsys.readouterr().out
 
@@ -239,7 +248,7 @@ class TestRunQueryCommand:
         ]
         warehouse_dir = _make_active_version(tmp_path, rows)
 
-        run_query_command(warehouse_dir, QueryFilters(regiao="SP", situacao="ATIVA"))
+        _run_query(warehouse_dir, QueryFilters(regiao="SP", situacao="ATIVA"), tmp_path)
 
         assert "Total: 1 lead(s)" in capsys.readouterr().out
 
@@ -250,7 +259,7 @@ class TestRunQueryCommand:
         ]
         warehouse_dir = _make_active_version(tmp_path, rows)
 
-        run_query_command(warehouse_dir, QueryFilters(com_email=True))
+        _run_query(warehouse_dir, QueryFilters(com_email=True), tmp_path)
 
         assert "Total: 1 lead(s)" in capsys.readouterr().out
 
@@ -260,26 +269,42 @@ class TestRunQueryCommand:
         rows = [_row(id_estab=str(i)) for i in range(5)]
         warehouse_dir = _make_active_version(tmp_path, rows)
 
-        run_query_command(warehouse_dir, QueryFilters(limit=2))
+        _run_query(warehouse_dir, QueryFilters(limit=2), tmp_path)
 
         # A tabela impressa é limitada a 2, mas o total contado não é.
         assert "Total: 5 lead(s)" in capsys.readouterr().out
 
 
 class TestMain:
-    def test_query_end_to_end_via_main(
-        self, tmp_path: Path, capsys: Capsys
-    ) -> None:
+    def test_query_end_to_end_via_main(self, tmp_path: Path, capsys: Capsys) -> None:
         rows = [_row(id_estab="1"), _row(id_estab="2")]
         warehouse_dir = _make_active_version(tmp_path, rows)
 
-        exit_code = main(["--warehouse-dir", str(warehouse_dir), "query", "--situacao", "ativa"])
+        exit_code = main(
+            [
+                "--warehouse-dir",
+                str(warehouse_dir),
+                "--audit-log-path",
+                str(tmp_path / "audit.parquet"),
+                "query",
+                "--situacao",
+                "ativa",
+            ]
+        )
 
         assert exit_code == 0
         assert "Total: 2 lead(s)" in capsys.readouterr().out
 
     def test_no_active_version_via_main_returns_1(self, tmp_path: Path) -> None:
-        exit_code = main(["--warehouse-dir", str(tmp_path / "empty"), "query"])
+        exit_code = main(
+            [
+                "--warehouse-dir",
+                str(tmp_path / "empty"),
+                "--audit-log-path",
+                str(tmp_path / "audit.parquet"),
+                "query",
+            ]
+        )
         assert exit_code == 1
 
     def test_runs_as_a_real_subprocess_script(self, tmp_path: Path) -> None:
@@ -297,6 +322,8 @@ class TestMain:
                 str(Path(__file__).parent.parent / "cli.py"),
                 "--warehouse-dir",
                 str(warehouse_dir),
+                "--audit-log-path",
+                str(tmp_path / "audit.parquet"),
                 "query",
                 "--regiao",
                 "SP",
@@ -317,3 +344,51 @@ class TestMain:
 
         assert result.returncode == 0, result.stderr
         assert "Total: 1 lead(s)" in result.stdout
+
+
+class TestRunQueryCommandAudit:
+    """`query` é "geração de lista" -- uma operação sensível (ver CLAUDE.md);
+    `run_query_command` precisa registrar um evento sempre que a consulta roda."""
+
+    def test_records_audit_event_with_filtros_and_count(self, tmp_path: Path) -> None:
+        rows = [
+            _row(id_estab="1", regiao="SP", situacao="ATIVA"),
+            _row(id_estab="2", regiao="RJ", situacao="ATIVA"),
+        ]
+        warehouse_dir = _make_active_version(tmp_path, rows)
+        audit_log_path = tmp_path / "audit.parquet"
+
+        run_query_command(
+            warehouse_dir,
+            QueryFilters(regiao="SP"),
+            audit_log_path=audit_log_path,
+            usuario="italo",
+        )
+
+        df = read_audit_log(audit_log_path)
+        assert df.height == 1
+        row = df.to_dicts()[0]
+        assert row["operacao"] == "query"
+        assert row["usuario"] == "italo"
+        assert row["n_registros"] == 1
+
+        filtros = json.loads(row["filtros"])
+        assert filtros["regiao"] == "SP"
+
+    def test_no_active_version_does_not_record_an_event(self, tmp_path: Path) -> None:
+        audit_log_path = tmp_path / "audit.parquet"
+
+        run_query_command(
+            tmp_path / "empty-warehouse", QueryFilters(), audit_log_path=audit_log_path
+        )
+
+        assert read_audit_log(audit_log_path).height == 0
+
+    def test_audit_log_path_flag_is_parsed(self) -> None:
+        args = parse_args(["--audit-log-path", "/custom/audit.parquet", "query"])
+        assert args.audit_log_path == Path("/custom/audit.parquet")
+
+    def test_audit_log_path_default_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AUDIT_LOG_PATH", "/tmp/custom-audit.parquet")
+        args = build_arg_parser().parse_args(["query"])
+        assert args.audit_log_path == Path("/tmp/custom-audit.parquet")

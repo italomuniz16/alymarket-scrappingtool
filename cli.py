@@ -14,11 +14,17 @@ Exemplo:
 sempre aplicados, sem flag para desativá-los: dado sintético nunca deve aparecer como
 lead real, e registros de difusão restrita (França) nunca podem entrar em lista de
 prospecção. Isso não é configurável por design.
+
+`query` é "geração de lista" — uma operação sensível (ver CLAUDE.md/
+`compliance/audit_log.py`): todo comando registra os filtros usados e a contagem
+total resultante no log de auditoria, sempre, sem flag pra desativar (mesma
+filosofia de `export/exporters.py`).
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import os
 import sys
@@ -30,6 +36,7 @@ from typing import Any
 import duckdb
 from dotenv import load_dotenv
 
+from src.compliance.audit_log import DEFAULT_AUDIT_LOG_PATH, new_event, record_event
 from src.etl.transform import get_active_leads_dir
 
 logger = logging.getLogger(__name__)
@@ -132,6 +139,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
             f"Default: $DATA_WAREHOUSE_DIR ou {DEFAULT_WAREHOUSE_DIR!r}."
         ),
     )
+    parser.add_argument(
+        "--audit-log-path",
+        dest="audit_log_path",
+        type=Path,
+        default=Path(os.environ.get("AUDIT_LOG_PATH", str(DEFAULT_AUDIT_LOG_PATH))),
+        help=(
+            "Onde registrar o log de auditoria (ver compliance/audit_log.py). "
+            f"Default: $AUDIT_LOG_PATH ou {str(DEFAULT_AUDIT_LOG_PATH)!r}."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     query_parser = subparsers.add_parser(
@@ -182,9 +199,21 @@ def filters_from_namespace(args: argparse.Namespace) -> QueryFilters:
     )
 
 
-def run_query_command(warehouse_dir: Path, filters: QueryFilters) -> int:
+def run_query_command(
+    warehouse_dir: Path,
+    filters: QueryFilters,
+    *,
+    audit_log_path: Path | str = DEFAULT_AUDIT_LOG_PATH,
+    usuario: str | None = None,
+) -> int:
     """Executa o comando `query`: resolve a versão ativa, roda a consulta e imprime
     a tabela + contagem total no terminal.
+
+    "Geração de lista" é uma operação sensível (ver CLAUDE.md/
+    `compliance/audit_log.py`): todo comando bem-sucedido (versão ativa encontrada)
+    registra os filtros usados e a contagem total resultante, sempre — sem parâmetro
+    pra pular essa etapa. A ausência de versão ativa (erro, `return 1` abaixo) não
+    gera evento: não houve consulta de verdade a registrar.
 
     Returns:
         Código de saída (`0` em sucesso, `1` se não houver versão ativa).
@@ -206,7 +235,19 @@ def run_query_command(warehouse_dir: Path, filters: QueryFilters) -> int:
         count_row = con.execute(built.count_sql, built.params).fetchone()
 
     assert count_row is not None
-    print(f"Total: {count_row[0]} lead(s)")
+    n_registros = count_row[0]
+    print(f"Total: {n_registros} lead(s)")
+
+    record_event(
+        new_event(
+            "query",
+            usuario=usuario,
+            filtros=dataclasses.asdict(filters),
+            n_registros=n_registros,
+        ),
+        audit_log_path,
+    )
+
     return 0
 
 
@@ -220,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "query":
         filters = filters_from_namespace(args)
-        return run_query_command(args.warehouse_dir, filters)
+        return run_query_command(args.warehouse_dir, filters, audit_log_path=args.audit_log_path)
 
     build_arg_parser().print_help()
     return 1

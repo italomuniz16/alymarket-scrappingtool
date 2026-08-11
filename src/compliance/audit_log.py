@@ -2,9 +2,27 @@
 RGPD "registre des traitements"): quem fez o quê, quando, com quais filtros, e
 quantos registros — persistido em Parquet (ver `AUDIT_LOG_PATH` em `.env.example`).
 
-Toda exportação (ver `export/exporters.py`) registra um evento aqui antes de
-escrever o arquivo de saída — é o que atende ao CLAUDE.md ("registro de tratamento",
-"auditoria — log de quem exportou o quê e quando").
+## Toda operação sensível registra um evento aqui
+
+- **Exportação** (`export/exporters.py`): todo `export_csv`/`export_xlsx` registra
+  antes de escrever o arquivo de saída — sem parâmetro pra pular essa etapa.
+- **Enriquecimento** (`enrichment/client.py::enrich_leads`, o único ponto de entrada
+  usado por `enrichment/providers.py`): registra depois de tentar cada lote,
+  quantos identificadores foram de fato encontrados.
+- **Geração de lista** (`cli.py::run_query_command`, comando `query`): registra os
+  filtros ICP usados e a contagem total de leads que bateram.
+
+Nenhuma dessas três chama isto condicionalmente nem tem flag pra desativar — é o que
+atende ao CLAUDE.md ("registro de tratamento", "auditoria — log de quem fez o quê e
+quando").
+
+## Consulta e exportação do log
+
+`query_audit_log` filtra o log persistido (por operação/usuário/período);
+`export_audit_log` escreve o resultado (filtrado ou não) em CSV, para revisão por um
+responsável de compliance fora deste sistema. Não confundir com
+`export.exporters.export_csv` — aquilo exporta LEADS (com portão de supressão);
+isto exporta o LOG DE AUDITORIA em si (é a trilha, não passa por supressão nenhuma).
 """
 
 from __future__ import annotations
@@ -114,3 +132,72 @@ def read_audit_log(log_path: Path | str = DEFAULT_AUDIT_LOG_PATH) -> pl.DataFram
     if not log_path.is_file():
         return pl.DataFrame(schema=_SCHEMA)
     return pl.read_parquet(log_path)
+
+
+def query_audit_log(
+    log_path: Path | str = DEFAULT_AUDIT_LOG_PATH,
+    *,
+    operacao: str | None = None,
+    usuario: str | None = None,
+    desde: datetime | None = None,
+    ate: datetime | None = None,
+) -> pl.DataFrame:
+    """Consulta o log de auditoria com filtros opcionais, combinados por AND. Sem
+    nenhum filtro, equivale a `read_audit_log` (só ordenado).
+
+    Args:
+        log_path: onde o log está persistido.
+        operacao: só eventos com esta operação exata (ex.: `"export_csv"`,
+            `"enrich_leads"`, `"query"`).
+        usuario: só eventos deste usuário/ator (comparação exata).
+        desde: só eventos com `quando >= desde` (inclusive). Precisa ser
+            timezone-aware (UTC) — mesma convenção de `AuditEvent.quando`
+            (sempre `datetime.now(UTC)`); um `datetime` ingênuo levanta erro do
+            próprio Polars ao comparar com a coluna, de propósito (evita comparação
+            silenciosamente errada entre fuso horários).
+        ate: só eventos com `quando <= ate` (inclusive); mesma exigência de `desde`.
+
+    Returns:
+        DataFrame filtrado, ordenado por `quando` decrescente (mais recente primeiro).
+    """
+    df = read_audit_log(log_path)
+    if operacao is not None:
+        df = df.filter(pl.col("operacao") == operacao)
+    if usuario is not None:
+        df = df.filter(pl.col("usuario") == usuario)
+    if desde is not None:
+        df = df.filter(pl.col("quando") >= desde)
+    if ate is not None:
+        df = df.filter(pl.col("quando") <= ate)
+    return df.sort("quando", descending=True)
+
+
+def export_audit_log(
+    dest: Path | str,
+    *,
+    log_path: Path | str = DEFAULT_AUDIT_LOG_PATH,
+    operacao: str | None = None,
+    usuario: str | None = None,
+    desde: datetime | None = None,
+    ate: datetime | None = None,
+) -> Path:
+    """Exporta o log de auditoria (ou um subconjunto filtrado — mesmos filtros de
+    `query_audit_log`) para CSV em `dest`, para revisão por um responsável de
+    compliance fora deste sistema (ex.: auditoria externa, atendimento a pedido de
+    titular sob LGPD/RGPD).
+
+    Diferente de `export.exporters.export_csv`/`export_xlsx` (que exportam LEADS,
+    sempre pelo portão de supressão): isto exporta o LOG DE AUDITORIA em si — a
+    trilha, não um dado sujeito a supressão.
+
+    Returns:
+        `dest`, já normalizado para `Path` (conveniência para o chamador).
+    """
+    df = query_audit_log(log_path, operacao=operacao, usuario=usuario, desde=desde, ate=ate)
+
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    df.write_csv(dest)
+
+    logger.info("Log de auditoria exportado (%d evento(s)) para %s", df.height, dest)
+    return dest
