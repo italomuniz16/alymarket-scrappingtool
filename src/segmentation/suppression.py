@@ -17,6 +17,15 @@ sempre:
 
 Cada etapa devolve uma contagem no `SuppressionReport` final, para auditoria (CLAUDE.md
 pede registro de tratamento em toda exportação).
+
+## Persistência da lista (opt-out) — Fase 2
+
+`load_suppression_list` é só leitura. `add_to_suppression_list`/
+`remove_from_suppression_list` são o lado de escrita: registram/removem um opt-out
+no CSV persistido (`SUPPRESSION_LIST_PATH`), idempotentes (registrar o mesmo opt-out
+duas vezes não duplica linha). `cli.py` expõe isso via o subcomando `optout` — é o
+"endpoint" deste projeto pra atender a um pedido de opt-out (não há API HTTP; a
+interface operacional do projeto inteiro é a CLI, ver `cli.py query`).
 """
 
 from __future__ import annotations
@@ -25,10 +34,19 @@ import csv
 import logging
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_SUPPRESSION_LIST_PATH = Path("./data/warehouse/suppression_list.csv")
+
+# Colunas gravadas por add_to_suppression_list/remove_from_suppression_list.
+# `motivo`/`registrado_em` são extras informativos (auditoria) -- load_suppression_list
+# ignora colunas desconhecidas (csv.DictReader por nome), então um CSV legado só com
+# `id_estab,email` continua funcionando normalmente.
+SUPPRESSION_CSV_FIELDNAMES: tuple[str, ...] = ("id_estab", "email", "motivo", "registrado_em")
 
 
 @dataclass(frozen=True)
@@ -69,6 +87,140 @@ def load_suppression_list(path: Path) -> SuppressionList:
         len(emails),
     )
     return SuppressionList(ids_estab=frozenset(ids_estab), emails=frozenset(emails))
+
+
+# -- Persistência (adicionar/remover opt-out) ----------------------------------------
+
+
+def _read_suppression_rows(path: Path) -> list[dict[str, str]]:
+    """Linhas brutas do CSV persistido (todas as colunas, não só os conjuntos
+    agregados que `load_suppression_list` devolve) — usado internamente por
+    add/remove pra reescrever o arquivo preservando `motivo`/`registrado_em`."""
+    if not path.is_file():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        return [
+            {
+                "id_estab": (row.get("id_estab") or "").strip(),
+                "email": (row.get("email") or "").strip().lower(),
+                "motivo": (row.get("motivo") or "").strip(),
+                "registrado_em": (row.get("registrado_em") or "").strip(),
+            }
+            for row in csv.DictReader(f)
+        ]
+
+
+def _write_suppression_rows(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SUPPRESSION_CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def add_to_suppression_list(
+    path: Path,
+    *,
+    id_estab: str | None = None,
+    email: str | None = None,
+    motivo: str | None = None,
+) -> bool:
+    """Registra um opt-out na lista persistida (append), criando o arquivo se ainda
+    não existir. Informe `id_estab` e/ou `email` (pelo menos um dos dois).
+
+    Idempotente: registrar exatamente a mesma combinação `id_estab`+`email` de novo
+    não duplica linha (mas note que `id_estab` e `email` suprimem
+    INDEPENDENTEMENTE — ver `is_suppressed` — então registrar só `id_estab="X"` numa
+    chamada e só `email="a@b.com"` noutra são dois opt-outs distintos, cada um
+    reforçando sua própria regra; não é preciso registrar os dois juntos).
+
+    Args:
+        path: onde a lista está persistida (ver `SUPPRESSION_LIST_PATH`).
+        id_estab: identificador do estabelecimento a suprimir.
+        email: e-mail a suprimir (normalizado para minúsculo).
+        motivo: texto livre opcional, só para auditoria/rastreabilidade — não afeta
+            o funcionamento da supressão em si.
+
+    Returns:
+        `True` se um registro novo foi adicionado; `False` se a combinação exata já
+        estava na lista (nada mudou).
+
+    Raises:
+        ValueError: se nem `id_estab` nem `email` forem informados.
+    """
+    id_estab = (id_estab or "").strip()
+    email = (email or "").strip().lower()
+    if not id_estab and not email:
+        raise ValueError("Informe id_estab e/ou email para registrar o opt-out.")
+
+    rows = _read_suppression_rows(path)
+    if any(r["id_estab"] == id_estab and r["email"] == email for r in rows):
+        logger.info(
+            "Opt-out já registrado (id_estab=%r, email=%r); nada a fazer.",
+            id_estab or None,
+            email or None,
+        )
+        return False
+
+    rows.append(
+        {
+            "id_estab": id_estab,
+            "email": email,
+            "motivo": (motivo or "").strip(),
+            "registrado_em": datetime.now(UTC).isoformat(),
+        }
+    )
+    _write_suppression_rows(path, rows)
+    logger.info(
+        "Opt-out registrado em %s: id_estab=%r email=%r", path, id_estab or None, email or None
+    )
+    return True
+
+
+def remove_from_suppression_list(
+    path: Path, *, id_estab: str | None = None, email: str | None = None
+) -> int:
+    """Remove da lista persistida toda linha que bata com `id_estab` e/ou `email`
+    informados (cada critério dado remove por si só — não precisa dos dois juntos).
+
+    Um arquivo ausente é tratado como "nada a remover" (retorna `0`), não como erro
+    — mesma convenção de `load_suppression_list` para lista vazia.
+
+    Args:
+        path: onde a lista está persistida.
+        id_estab: remove toda linha com este `id_estab`.
+        email: remove toda linha com este e-mail (comparação case-insensitive).
+
+    Returns:
+        Quantas linhas foram removidas.
+
+    Raises:
+        ValueError: se nem `id_estab` nem `email` forem informados.
+    """
+    id_estab = (id_estab or "").strip()
+    email = (email or "").strip().lower()
+    if not id_estab and not email:
+        raise ValueError("Informe id_estab e/ou email para remover o opt-out.")
+    if not path.is_file():
+        return 0
+
+    rows = _read_suppression_rows(path)
+    remaining = [
+        r
+        for r in rows
+        if not ((id_estab and r["id_estab"] == id_estab) or (email and r["email"] == email))
+    ]
+    n_removed = len(rows) - len(remaining)
+    if n_removed:
+        _write_suppression_rows(path, remaining)
+        logger.info(
+            "%d opt-out(s) removido(s) de %s: id_estab=%r email=%r",
+            n_removed,
+            path,
+            id_estab or None,
+            email or None,
+        )
+    return n_removed
 
 
 def is_suppressed(lead: Mapping[str, Any], suppression: SuppressionList) -> bool:

@@ -115,6 +115,63 @@ class TestEnrichmentCache:
             assert db_path.parent.is_dir()
 
 
+class TestEnrichmentCacheRetention:
+    """`created_at` (retenção) é um conceito separado de `expires_at` (frescor) --
+    ver docstring de `EnrichmentCache`. `purge_created_before` é a base do job de
+    limpeza de `compliance/retention.py`."""
+
+    def test_set_records_created_at(self, tmp_path: Path) -> None:
+        with EnrichmentCache(tmp_path / "cache.sqlite") as cache:
+            cache.set("x", {"a": 1}, ttl_seconds=3600, now=1000.0)
+
+            row = cache._conn.execute(
+                "SELECT created_at FROM cache WHERE key = ?", ("x",)
+            ).fetchone()
+            assert row == (1000.0,)
+
+    def test_purge_removes_entries_created_before_cutoff(self, tmp_path: Path) -> None:
+        with EnrichmentCache(tmp_path / "cache.sqlite") as cache:
+            cache.set("velho", {"a": 1}, ttl_seconds=3600, now=1000.0)
+            cache.set("novo", {"a": 2}, ttl_seconds=3600, now=2000.0)
+
+            n_purged = cache.purge_created_before(1500.0)
+
+            assert n_purged == 1
+            assert cache.get("velho", now=1000.0) is None
+            assert cache.get("novo", now=2000.0) == {"a": 2}
+
+    def test_purge_ignores_freshness_expires_at(self, tmp_path: Path) -> None:
+        """Uma entrada recém-criada mas já "expirada" (ttl de frescor curto) NÃO é
+        expurgada por retenção -- retenção olha só created_at."""
+        with EnrichmentCache(tmp_path / "cache.sqlite") as cache:
+            cache.set("recente-mas-vencida", {"a": 1}, ttl_seconds=1, now=2000.0)
+
+            n_purged = cache.purge_created_before(1500.0)  # corte bem antes de 2000.0
+
+            assert n_purged == 0
+            row = cache._conn.execute(
+                "SELECT 1 FROM cache WHERE key = ?", ("recente-mas-vencida",)
+            ).fetchone()
+            assert row is not None
+
+    def test_purge_returns_zero_when_nothing_to_purge(self, tmp_path: Path) -> None:
+        with EnrichmentCache(tmp_path / "cache.sqlite") as cache:
+            cache.set("x", {"a": 1}, ttl_seconds=3600, now=2000.0)
+            assert cache.purge_created_before(1000.0) == 0
+
+    def test_set_on_existing_key_refreshes_created_at(self, tmp_path: Path) -> None:
+        """INSERT OR REPLACE: reescrever uma chave existente conta como um dado novo
+        pra fins de retenção, não herda o created_at antigo."""
+        with EnrichmentCache(tmp_path / "cache.sqlite") as cache:
+            cache.set("x", {"a": 1}, ttl_seconds=3600, now=1000.0)
+            cache.set("x", {"a": 2}, ttl_seconds=3600, now=5000.0)
+
+            row = cache._conn.execute(
+                "SELECT created_at FROM cache WHERE key = ?", ("x",)
+            ).fetchone()
+            assert row == (5000.0,)
+
+
 @dataclass
 class FakeApiServer:
     """Handler de `httpx.MockTransport`: cada URL tem uma sequência de respostas

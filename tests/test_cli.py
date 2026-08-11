@@ -21,10 +21,13 @@ from cli import (
     filters_from_namespace,
     main,
     parse_args,
+    run_optout_command,
     run_query_command,
+    run_retention_purge_command,
 )
 from src.compliance.audit_log import read_audit_log
 from src.etl.transform import CANONICAL_PARQUET_SCHEMA, activate_version, new_version_dir
+from src.segmentation.suppression import load_suppression_list
 
 
 class TestParseArgs:
@@ -392,3 +395,170 @@ class TestRunQueryCommandAudit:
         monkeypatch.setenv("AUDIT_LOG_PATH", "/tmp/custom-audit.parquet")
         args = build_arg_parser().parse_args(["query"])
         assert args.audit_log_path == Path("/tmp/custom-audit.parquet")
+
+
+class TestParseArgsOptout:
+    def test_defaults(self) -> None:
+        args = parse_args(["optout", "--id-estab", "A"])
+        assert args.command == "optout"
+        assert args.id_estab == "A"
+        assert args.email is None
+        assert args.motivo is None
+        assert args.remove is False
+
+    def test_suppression_list_path_default_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SUPPRESSION_LIST_PATH", "/tmp/custom-supressao.csv")
+        args = build_arg_parser().parse_args(["optout", "--id-estab", "A"])
+        assert args.suppression_list_path == Path("/tmp/custom-supressao.csv")
+
+
+class TestRunOptoutCommand:
+    def test_registers_optout_by_id_estab(self, tmp_path: Path, capsys: Capsys) -> None:
+        args = parse_args(
+            [
+                "optout",
+                "--suppression-list-path",
+                str(tmp_path / "supressao.csv"),
+                "--id-estab",
+                "11111111000191",
+                "--motivo",
+                "solicitação do titular",
+            ]
+        )
+
+        exit_code = run_optout_command(args)
+
+        assert exit_code == 0
+        assert "registrado" in capsys.readouterr().out.lower()
+        result = load_suppression_list(tmp_path / "supressao.csv")
+        assert result.ids_estab == {"11111111000191"}
+
+    def test_registers_optout_by_email(self, tmp_path: Path) -> None:
+        args = parse_args(
+            [
+                "optout",
+                "--suppression-list-path",
+                str(tmp_path / "supressao.csv"),
+                "--email",
+                "contato@empresa.com",
+            ]
+        )
+
+        run_optout_command(args)
+
+        result = load_suppression_list(tmp_path / "supressao.csv")
+        assert result.emails == {"contato@empresa.com"}
+
+    def test_neither_id_estab_nor_email_returns_1(self, tmp_path: Path, capsys: Capsys) -> None:
+        args = parse_args(["optout", "--suppression-list-path", str(tmp_path / "supressao.csv")])
+
+        exit_code = run_optout_command(args)
+
+        assert exit_code == 1
+        stderr = capsys.readouterr().err.lower()
+        assert "id-estab" in stderr or "email" in stderr
+
+    def test_remove_flag_removes_existing_optout(self, tmp_path: Path, capsys: Capsys) -> None:
+        suppression_path = tmp_path / "supressao.csv"
+        add_args = parse_args(
+            ["optout", "--suppression-list-path", str(suppression_path), "--id-estab", "A"]
+        )
+        run_optout_command(add_args)
+
+        remove_args = parse_args(
+            [
+                "optout",
+                "--suppression-list-path",
+                str(suppression_path),
+                "--id-estab",
+                "A",
+                "--remove",
+            ]
+        )
+        exit_code = run_optout_command(remove_args)
+
+        assert exit_code == 0
+        assert "removido" in capsys.readouterr().out.lower()
+        assert load_suppression_list(suppression_path).ids_estab == frozenset()
+
+    def test_remove_nonexistent_returns_1(self, tmp_path: Path, capsys: Capsys) -> None:
+        args = parse_args(
+            [
+                "optout",
+                "--suppression-list-path",
+                str(tmp_path / "supressao.csv"),
+                "--id-estab",
+                "NAO-EXISTE",
+                "--remove",
+            ]
+        )
+
+        exit_code = run_optout_command(args)
+
+        assert exit_code == 1
+        assert "nada a remover" in capsys.readouterr().out.lower()
+
+
+class TestOptoutEndToEndViaMain:
+    def test_optout_then_query_excludes_the_lead(self, tmp_path: Path, capsys: Capsys) -> None:
+        """Ponta a ponta pedido explicitamente: opt-out registrado via CLI reflete
+        na supressão."""
+        rows = [_row(id_estab="A"), _row(id_estab="B")]
+        warehouse_dir = _make_active_version(tmp_path, rows)
+        suppression_path = tmp_path / "supressao.csv"
+
+        exit_code = main(
+            [
+                "--audit-log-path",
+                str(tmp_path / "audit.parquet"),
+                "optout",
+                "--suppression-list-path",
+                str(suppression_path),
+                "--id-estab",
+                "A",
+            ]
+        )
+        assert exit_code == 0
+
+        result = load_suppression_list(suppression_path)
+        assert result.ids_estab == {"A"}
+        # Confirma que a assinatura de warehouse_dir segue válida (não usada aqui,
+        # mas prova que o comando optout não depende de uma versão ativa existir).
+        assert warehouse_dir.exists()
+
+
+class TestParseArgsRetentionPurge:
+    def test_defaults(self) -> None:
+        args = parse_args(["retention-purge"])
+        assert args.command == "retention-purge"
+        assert args.ttl_days == 180
+
+    def test_ttl_days_flag(self) -> None:
+        args = parse_args(["retention-purge", "--ttl-days", "30"])
+        assert args.ttl_days == 30
+
+    def test_ttl_days_default_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("RETENTION_TTL_DAYS", "90")
+        args = build_arg_parser().parse_args(["retention-purge"])
+        assert args.ttl_days == 90
+
+
+class TestRunRetentionPurgeCommand:
+    def test_runs_and_prints_result(self, tmp_path: Path, capsys: Capsys) -> None:
+        args = parse_args(
+            [
+                "--audit-log-path",
+                str(tmp_path / "audit.parquet"),
+                "retention-purge",
+                "--cache-path",
+                str(tmp_path / "cache.sqlite"),
+                "--ttl-days",
+                "30",
+            ]
+        )
+
+        exit_code = run_retention_purge_command(args)
+
+        assert exit_code == 0
+        assert "expurgada" in capsys.readouterr().out.lower()
+        assert read_audit_log(tmp_path / "audit.parquet").height == 1

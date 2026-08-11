@@ -8,6 +8,22 @@ Exemplo:
     python cli.py query --pais BR --regiao SP --cod-atividade 8630501 \\
         --situacao ATIVA --com-email --limit 50
 
+Comando `optout`: registra (ou remove, com `--remove`) um opt-out na lista de
+supressão persistida (ver `segmentation/suppression.py`) — é o "endpoint" deste
+projeto pra atender a um pedido de opt-out; não há API HTTP, a interface
+operacional é a CLI.
+
+Exemplo:
+    python cli.py optout --id-estab 11111111000191 --motivo "solicitação do titular"
+    python cli.py optout --email contato@empresa.com --remove
+
+Comando `retention-purge`: roda o job de limpeza de retenção (ver
+`compliance/retention.py`) — expurga do cache de enriquecimento entradas mais
+antigas que o TTL configurado.
+
+Exemplo:
+    python cli.py retention-purge --ttl-days 180
+
 ## Compliance (ver CLAUDE.md)
 
 `is_synthetic = false` e `flag_difusao_restrita = false` são filtros *hard*,
@@ -15,10 +31,9 @@ sempre aplicados, sem flag para desativá-los: dado sintético nunca deve aparec
 lead real, e registros de difusão restrita (França) nunca podem entrar em lista de
 prospecção. Isso não é configurável por design.
 
-`query` é "geração de lista" — uma operação sensível (ver CLAUDE.md/
-`compliance/audit_log.py`): todo comando registra os filtros usados e a contagem
-total resultante no log de auditoria, sempre, sem flag pra desativar (mesma
-filosofia de `export/exporters.py`).
+`query`, `optout` e `retention-purge` são operações sensíveis (ver CLAUDE.md/
+`compliance/audit_log.py`): cada uma registra um evento no log de auditoria, sempre,
+sem flag pra desativar (mesma filosofia de `export/exporters.py`).
 """
 
 from __future__ import annotations
@@ -37,7 +52,14 @@ import duckdb
 from dotenv import load_dotenv
 
 from src.compliance.audit_log import DEFAULT_AUDIT_LOG_PATH, new_event, record_event
+from src.compliance.retention import DEFAULT_RETENTION_TTL_DAYS, run_retention_job
+from src.enrichment.client import DEFAULT_CACHE_PATH
 from src.etl.transform import get_active_leads_dir
+from src.segmentation.suppression import (
+    DEFAULT_SUPPRESSION_LIST_PATH,
+    add_to_suppression_list,
+    remove_from_suppression_list,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +199,53 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"Máximo de linhas retornadas (default: {DEFAULT_LIMIT}).",
     )
 
+    optout_parser = subparsers.add_parser(
+        "optout", help="Registra (ou remove, com --remove) um opt-out na lista de supressão."
+    )
+    optout_parser.add_argument(
+        "--suppression-list-path",
+        dest="suppression_list_path",
+        type=Path,
+        default=Path(os.environ.get("SUPPRESSION_LIST_PATH", str(DEFAULT_SUPPRESSION_LIST_PATH))),
+        help=(
+            "Onde a lista de supressão está persistida. "
+            f"Default: $SUPPRESSION_LIST_PATH ou {str(DEFAULT_SUPPRESSION_LIST_PATH)!r}."
+        ),
+    )
+    optout_parser.add_argument(
+        "--id-estab", dest="id_estab", help="Identificador do estabelecimento."
+    )
+    optout_parser.add_argument("--email", help="E-mail a suprimir.")
+    optout_parser.add_argument(
+        "--motivo", help="Texto livre opcional (só para auditoria/rastreabilidade)."
+    )
+    optout_parser.add_argument(
+        "--remove",
+        action="store_true",
+        help="Remove o opt-out em vez de registrá-lo (default: registra).",
+    )
+
+    retention_parser = subparsers.add_parser(
+        "retention-purge", help="Roda o job de limpeza de retenção (compliance/retention.py)."
+    )
+    retention_parser.add_argument(
+        "--cache-path",
+        dest="cache_path",
+        type=Path,
+        default=DEFAULT_CACHE_PATH,
+        help=f"Cache de enriquecimento a expurgar. Default: {str(DEFAULT_CACHE_PATH)!r}.",
+    )
+    retention_parser.add_argument(
+        "--ttl-days",
+        dest="ttl_days",
+        type=int,
+        default=int(os.environ.get("RETENTION_TTL_DAYS", str(DEFAULT_RETENTION_TTL_DAYS))),
+        help=(
+            "Dias de retenção antes do expurgo. "
+            f"Default: $RETENTION_TTL_DAYS ou {DEFAULT_RETENTION_TTL_DAYS}."
+        ),
+    )
+
     return parser
 
 
@@ -251,6 +320,54 @@ def run_query_command(
     return 0
 
 
+def run_optout_command(args: argparse.Namespace) -> int:
+    """Executa o comando `optout`: registra ou remove (`--remove`) um opt-out na
+    lista de supressão persistida, e imprime o resultado no terminal.
+
+    Returns:
+        Código de saída (`0` em sucesso, `1` se nem `--id-estab` nem `--email`
+        foram informados, ou se `--remove` não encontrou nada pra remover).
+    """
+    if not args.id_estab and not args.email:
+        print("Erro: informe --id-estab e/ou --email.", file=sys.stderr)
+        return 1
+
+    if args.remove:
+        n_removed = remove_from_suppression_list(
+            args.suppression_list_path, id_estab=args.id_estab, email=args.email
+        )
+        if n_removed == 0:
+            print("Nada a remover: opt-out não encontrado na lista.")
+            return 1
+        print(f"{n_removed} opt-out(s) removido(s) de {args.suppression_list_path}.")
+        return 0
+
+    added = add_to_suppression_list(
+        args.suppression_list_path,
+        id_estab=args.id_estab,
+        email=args.email,
+        motivo=args.motivo,
+    )
+    if added:
+        print(f"Opt-out registrado em {args.suppression_list_path}.")
+    else:
+        print("Opt-out já estava registrado; nada a fazer.")
+    return 0
+
+
+def run_retention_purge_command(args: argparse.Namespace) -> int:
+    """Executa o comando `retention-purge`: roda o job de limpeza de retenção e
+    imprime quantas entradas foram expurgadas."""
+    result = run_retention_job(
+        cache_path=args.cache_path, ttl_days=args.ttl_days, audit_log_path=args.audit_log_path
+    )
+    print(
+        f"{result.n_purged} entrada(s) expurgada(s) de {result.cache_path} "
+        f"(corte: {result.cutoff.isoformat()})."
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Ponto de entrada de linha de comando."""
     if hasattr(sys.stdout, "reconfigure"):
@@ -262,6 +379,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "query":
         filters = filters_from_namespace(args)
         return run_query_command(args.warehouse_dir, filters, audit_log_path=args.audit_log_path)
+
+    if args.command == "optout":
+        return run_optout_command(args)
+
+    if args.command == "retention-purge":
+        return run_retention_purge_command(args)
 
     build_arg_parser().print_help()
     return 1

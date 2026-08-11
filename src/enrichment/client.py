@@ -80,6 +80,16 @@ class EnrichmentCache:
     """Cache local persistido (SQLite) com TTL por entrada — evita rechamar o mesmo
     CNPJ/SIREN dentro da janela de validade, inclusive entre execuções diferentes do
     processo (não é só um dict em memória).
+
+    Guarda `created_at` além de `expires_at`: são conceitos diferentes.
+    `expires_at` (`ttl_seconds`, passado em cada `set()`) é sobre FRESCOR — quando um
+    valor cacheado deixa de ser confiável pra reuso (dias, ver
+    `ENRICHMENT_CACHE_TTL_SECONDS` no `.env.example`). `created_at` é sobre
+    RETENÇÃO — desde quando esse dado enriquecido está guardado, independente de
+    ainda estar "fresco" ou não; é o que `compliance/retention.py` usa pra decidir o
+    que expurgar (janela bem mais longa, meses — `RETENTION_TTL_DAYS`). Uma entrada
+    pode reexpirar (`expires_at`) e ser reescrita várias vezes sem nunca ser
+    expurgada por retenção, e vice-versa.
     """
 
     def __init__(self, db_path: Path | str) -> None:
@@ -88,7 +98,8 @@ class EnrichmentCache:
         self._conn = sqlite3.connect(self.db_path)
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS cache ("
-            "key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at REAL NOT NULL)"
+            "key TEXT PRIMARY KEY, value TEXT NOT NULL, "
+            "created_at REAL NOT NULL, expires_at REAL NOT NULL)"
         )
         self._conn.commit()
 
@@ -116,10 +127,23 @@ class EnrichmentCache:
     ) -> None:
         current = now if now is not None else time.time()
         self._conn.execute(
-            "INSERT OR REPLACE INTO cache (key, value, expires_at) VALUES (?, ?, ?)",
-            (key, json.dumps(value), current + ttl_seconds),
+            "INSERT OR REPLACE INTO cache (key, value, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (key, json.dumps(value), current, current + ttl_seconds),
         )
         self._conn.commit()
+
+    def purge_created_before(self, cutoff: float) -> int:
+        """Expurga (DELETE) toda entrada com `created_at < cutoff` — o "job de
+        limpeza" de retenção (ver `compliance/retention.py`), independente de a
+        entrada ainda estar "fresca" (`expires_at`) ou não: retenção é sobre por
+        quanto tempo o dado pode ficar guardado, não sobre se ele ainda é útil.
+
+        Returns:
+            Número de entradas removidas.
+        """
+        cursor = self._conn.execute("DELETE FROM cache WHERE created_at < ?", (cutoff,))
+        self._conn.commit()
+        return cursor.rowcount
 
     def close(self) -> None:
         self._conn.close()

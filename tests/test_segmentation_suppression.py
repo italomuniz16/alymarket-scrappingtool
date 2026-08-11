@@ -12,6 +12,7 @@ import pytest
 
 from src.segmentation.suppression import (
     SuppressionList,
+    add_to_suppression_list,
     apply_suppression_gate,
     apply_suppression_gate_from_path,
     dedupe_by_email_domain,
@@ -20,6 +21,7 @@ from src.segmentation.suppression import (
     is_hard_excluded,
     is_suppressed,
     load_suppression_list,
+    remove_from_suppression_list,
 )
 
 
@@ -131,6 +133,157 @@ class TestLoadSuppressionList:
         assert result == SuppressionList()
 
 
+class TestAddToSuppressionList:
+    def test_creates_file_when_missing(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        assert not path.exists()
+
+        added = add_to_suppression_list(path, id_estab="11111111000191")
+
+        assert added is True
+        assert path.is_file()
+
+    def test_add_by_id_estab_only(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        add_to_suppression_list(path, id_estab="11111111000191")
+
+        result = load_suppression_list(path)
+        assert result.ids_estab == {"11111111000191"}
+        assert result.emails == frozenset()
+
+    def test_add_by_email_only_normalizes_to_lowercase(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        add_to_suppression_list(path, email="Contato@Empresa.COM")
+
+        result = load_suppression_list(path)
+        assert result.emails == {"contato@empresa.com"}
+
+    def test_add_both_id_estab_and_email(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        add_to_suppression_list(path, id_estab="A", email="a@x.com")
+
+        result = load_suppression_list(path)
+        assert result.ids_estab == {"A"}
+        assert result.emails == {"a@x.com"}
+
+    def test_appends_to_existing_entries(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        add_to_suppression_list(path, id_estab="A")
+        add_to_suppression_list(path, id_estab="B")
+
+        result = load_suppression_list(path)
+        assert result.ids_estab == {"A", "B"}
+
+    def test_duplicate_add_is_idempotent(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        first = add_to_suppression_list(path, id_estab="A", email="a@x.com")
+        second = add_to_suppression_list(path, id_estab="A", email="a@x.com")
+
+        assert first is True
+        assert second is False
+        result = load_suppression_list(path)
+        assert result.ids_estab == {"A"}  # não duplicou linha
+
+    def test_neither_id_estab_nor_email_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            add_to_suppression_list(tmp_path / "supressao.csv")
+
+    def test_motivo_persisted_but_does_not_affect_loading(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        add_to_suppression_list(path, id_estab="A", motivo="solicitação do titular")
+
+        raw = path.read_text(encoding="utf-8")
+        assert "solicitação do titular" in raw
+        # load_suppression_list só expõe os conjuntos agregados, não o motivo.
+        assert load_suppression_list(path).ids_estab == {"A"}
+
+
+class TestRemoveFromSuppressionList:
+    def test_removes_by_id_estab(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        add_to_suppression_list(path, id_estab="A")
+        add_to_suppression_list(path, id_estab="B")
+
+        n_removed = remove_from_suppression_list(path, id_estab="A")
+
+        assert n_removed == 1
+        assert load_suppression_list(path).ids_estab == {"B"}
+
+    def test_removes_by_email(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        add_to_suppression_list(path, email="a@x.com")
+        add_to_suppression_list(path, email="b@x.com")
+
+        n_removed = remove_from_suppression_list(path, email="a@x.com")
+
+        assert n_removed == 1
+        assert load_suppression_list(path).emails == {"b@x.com"}
+
+    def test_missing_file_returns_zero(self, tmp_path: Path) -> None:
+        n_removed = remove_from_suppression_list(tmp_path / "nao-existe.csv", id_estab="A")
+        assert n_removed == 0
+
+    def test_no_match_returns_zero_and_leaves_file_untouched(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        add_to_suppression_list(path, id_estab="A")
+
+        n_removed = remove_from_suppression_list(path, id_estab="NAO-EXISTE")
+
+        assert n_removed == 0
+        assert load_suppression_list(path).ids_estab == {"A"}
+
+    def test_neither_id_estab_nor_email_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            remove_from_suppression_list(tmp_path / "supressao.csv")
+
+
+class TestOptOutAdditionReflectedInSuppression:
+    """O caso pedido explicitamente: registrar um opt-out precisa se refletir de
+    verdade no portão de supressão (`apply_suppression_gate`) -- não só na lista
+    carregada isoladamente."""
+
+    def test_lead_excluded_after_optout_by_id_estab(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        leads = [_lead(id_estab="A"), _lead(id_estab="B")]
+
+        # Antes do opt-out, os dois passam.
+        before, _ = apply_suppression_gate_from_path(leads, path)
+        assert {lead["id_estab"] for lead in before} == {"A", "B"}
+
+        add_to_suppression_list(path, id_estab="A", motivo="solicitação do titular")
+
+        after, report = apply_suppression_gate_from_path(leads, path)
+        assert {lead["id_estab"] for lead in after} == {"B"}
+        assert report.n_suppressed == 1
+
+    def test_lead_excluded_after_optout_by_email(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        # Domínios diferentes de propósito: senão dedupe_by_email_domain (que roda
+        # antes da supressão no portão) já removeria um dos dois por conta própria,
+        # confundindo o que este teste quer provar.
+        leads = [
+            _lead(id_estab="A", email="a@empresa1.com"),
+            _lead(id_estab="B", email="b@empresa2.com"),
+        ]
+
+        add_to_suppression_list(path, email="a@empresa1.com")
+
+        final, report = apply_suppression_gate_from_path(leads, path)
+        assert {lead["id_estab"] for lead in final} == {"B"}
+        assert report.n_suppressed == 1
+
+    def test_lead_no_longer_excluded_after_removal(self, tmp_path: Path) -> None:
+        path = tmp_path / "supressao.csv"
+        leads = [_lead(id_estab="A"), _lead(id_estab="B")]
+        add_to_suppression_list(path, id_estab="A")
+
+        remove_from_suppression_list(path, id_estab="A")
+
+        final, report = apply_suppression_gate_from_path(leads, path)
+        assert {lead["id_estab"] for lead in final} == {"A", "B"}
+        assert report.n_suppressed == 0
+
+
 class TestIsSuppressed:
     SUPPRESSION = SuppressionList(
         ids_estab=frozenset({"11111111000191"}), emails=frozenset({"opt-out@x.com"})
@@ -208,8 +361,12 @@ class TestApplySuppressionGate:
         final, report = apply_suppression_gate([lead], SuppressionList())
         assert final == [lead]
         assert report == report.__class__(
-            n_in=1, n_hard_excluded=0, n_deduped_id_estab=0, n_deduped_email_domain=0,
-            n_suppressed=0, n_out=1,
+            n_in=1,
+            n_hard_excluded=0,
+            n_deduped_id_estab=0,
+            n_deduped_email_domain=0,
+            n_suppressed=0,
+            n_out=1,
         )
 
     def test_report_counts_are_consistent(self) -> None:
