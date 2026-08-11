@@ -13,6 +13,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+import cli
 from cli import (
     DEFAULT_LIMIT,
     QueryFilters,
@@ -21,6 +22,7 @@ from cli import (
     filters_from_namespace,
     main,
     parse_args,
+    run_ingest_command,
     run_optout_command,
     run_query_command,
     run_retention_purge_command,
@@ -562,3 +564,107 @@ class TestRunRetentionPurgeCommand:
         assert exit_code == 0
         assert "expurgada" in capsys.readouterr().out.lower()
         assert read_audit_log(tmp_path / "audit.parquet").height == 1
+
+
+class TestParseArgsIngest:
+    def test_defaults(self) -> None:
+        args = parse_args(["ingest"])
+        assert args.command == "ingest"
+        assert args.fonte == "opencnpj"
+        assert args.n == 40
+
+    def test_n_flag(self) -> None:
+        args = parse_args(["ingest", "--n", "5"])
+        assert args.n == 5
+
+    def test_invalid_fonte_raises_system_exit(self) -> None:
+        with pytest.raises(SystemExit):
+            parse_args(["ingest", "--fonte", "nao-existe"])
+
+
+class _FakeDiscovery:
+    """Fake de `SitemapCnpjDiscovery` -- sem rede, devolve uma lista fixa."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def __enter__(self) -> _FakeDiscovery:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        pass
+
+    def discover(self, n: int) -> list[str]:
+        return ["00000000083208", "11111111000111"][:n]
+
+
+class _FakeOpenCnpjClient:
+    """Fake de `OpenCnpjClient` -- sem rede, devolve registros fixos pros CNPJs
+    conhecidos e pula os demais (mesmo comportamento do cliente real p/ not-found)."""
+
+    _RECORDS = {
+        "00000000083208": {
+            "cnpj": "00000000083208",
+            "situacaoCadastral": "Ativa",
+            "razaoSocial": "BANCO DO BRASIL SA",
+            "nomeFantasia": None,
+            "dataInicioAtividades": "26/09/1974",
+            "naturezaJuridica": "Sociedade de Economia Mista (2038)",
+            "capitalSocial": 120000000000,
+            "email": None,
+            "telefone": None,
+            "municipio": "SAO PAULO",
+            "uf": "SP",
+            "cep": "04004-040",
+            "cnaes": [{"cnae": "64.22-1-00", "descricao": "Bancos"}],
+        },
+        "11111111000111": {
+            "cnpj": "11111111000111",
+            "situacaoCadastral": "Ativa",
+            "razaoSocial": "EMPRESA DOIS LTDA",
+            "nomeFantasia": None,
+            "dataInicioAtividades": "01/01/2020",
+            "naturezaJuridica": "Sociedade Empresaria Limitada (2062)",
+            "capitalSocial": 50000,
+            "email": None,
+            "telefone": None,
+            "municipio": "CAMPINAS",
+            "uf": "SP",
+            "cep": "13000-000",
+            "cnaes": [{"cnae": "47.11-3-02", "descricao": "Comercio"}],
+        },
+    }
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def __enter__(self) -> _FakeOpenCnpjClient:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        pass
+
+    def fetch_many(self, cnpjs: list[str]) -> list[dict[str, object]]:
+        return [self._RECORDS[c] for c in cnpjs if c in self._RECORDS]
+
+
+class TestRunIngestCommand:
+    def test_activates_new_version_and_prints_summary(
+        self, tmp_path: Path, capsys: Capsys, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(cli, "SitemapCnpjDiscovery", _FakeDiscovery)
+        monkeypatch.setattr(cli, "OpenCnpjClient", _FakeOpenCnpjClient)
+        warehouse_dir = tmp_path / "warehouse"
+        args = parse_args(["ingest", "--n", "2"])
+
+        exit_code = run_ingest_command(warehouse_dir, args)
+
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        assert "2 lead(s) gravado(s)" in out
+        assert "Versão ativada" in out
+
+        active_dir = warehouse_dir / "versions"
+        df = pl.read_parquet((active_dir / "*" / "pais=BR" / "*.parquet").as_posix())
+        assert set(df["id_estab"].to_list()) == {"00000000083208", "11111111000111"}
+        assert set(df["fonte"].unique().to_list()) == {"BR_OPENCNPJ"}

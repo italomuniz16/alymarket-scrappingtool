@@ -24,6 +24,18 @@ antigas que o TTL configurado.
 Exemplo:
     python cli.py retention-purge --ttl-days 180
 
+Comando `ingest`: coleta leads reais de uma fonte externa e ativa uma nova versão
+do warehouse (blue/green — ver `etl/transform.py`). Por enquanto só suporta
+`--fonte opencnpj` (default): descoberta de CNPJs via sitemap público do cnpja.com
+(`ingestion/br_opencnpj/discovery.py`, permitido pelo `robots.txt`) + busca de cada
+um na API aberta e sem autenticação do OpenCNPJ (`ingestion/br_opencnpj/client.py`,
+dados oficiais da Receita Federal) — fonte alternativa enquanto
+`ingestion/br_receita/downloader.py` (URL oficial original) está desativado (portal
+migrou de estrutura).
+
+Exemplo:
+    python cli.py ingest --fonte opencnpj --n 100
+
 ## Compliance (ver CLAUDE.md)
 
 `is_synthetic = false` e `flag_difusao_restrita = false` são filtros *hard*,
@@ -54,7 +66,9 @@ from dotenv import load_dotenv
 from src.compliance.audit_log import DEFAULT_AUDIT_LOG_PATH, new_event, record_event
 from src.compliance.retention import DEFAULT_RETENTION_TTL_DAYS, run_retention_job
 from src.enrichment.client import DEFAULT_CACHE_PATH
-from src.etl.transform import get_active_leads_dir
+from src.etl.transform import get_active_leads_dir, run_transform_pipeline_opencnpj
+from src.ingestion.br_opencnpj.client import OpenCnpjClient
+from src.ingestion.br_opencnpj.discovery import SitemapCnpjDiscovery
 from src.segmentation.suppression import (
     DEFAULT_SUPPRESSION_LIST_PATH,
     add_to_suppression_list,
@@ -246,6 +260,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    ingest_parser = subparsers.add_parser(
+        "ingest",
+        help="Coleta leads reais de uma fonte externa e ativa uma nova versão do warehouse.",
+    )
+    ingest_parser.add_argument(
+        "--fonte",
+        choices=["opencnpj"],
+        default="opencnpj",
+        help=(
+            "Fonte de ingestão. Por enquanto só 'opencnpj' (default) -- ver CLAUDE.md "
+            "sobre o conector oficial da Receita Federal estar desativado."
+        ),
+    )
+    ingest_parser.add_argument(
+        "--n", type=int, default=40, help="Quantidade de CNPJs a buscar (default: 40)."
+    )
+
     return parser
 
 
@@ -368,6 +399,49 @@ def run_retention_purge_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_ingest_command(warehouse_dir: Path, args: argparse.Namespace) -> int:
+    """Executa o comando `ingest`: descobre CNPJs reais, busca cada um na fonte
+    escolhida, materializa e ativa uma nova versão do warehouse.
+
+    Por enquanto só suporta `--fonte opencnpj` (ver `src/ingestion/br_opencnpj/`):
+    descoberta via sitemap público do cnpja.com (permitido pelo robots.txt) + busca
+    via API aberta do OpenCNPJ (sem autenticação, dados oficiais da Receita
+    Federal) — fonte alternativa enquanto `ingestion/br_receita/downloader.py` (URL
+    oficial original) está desativado.
+
+    Returns:
+        Código de saída (`0` em sucesso/versão ativada, `1` se a validação de
+        qualidade reprovar e a versão não for ativada).
+    """
+    print(f"Descobrindo até {args.n} CNPJ(s) via sitemap público (cnpja.com)...")
+    with SitemapCnpjDiscovery() as discovery:
+        cnpjs = discovery.discover(args.n)
+    print(f"{len(cnpjs)} CNPJ(s) encontrado(s).")
+
+    with OpenCnpjClient() as client:
+        records = list(client.fetch_many(cnpjs))
+    print(f"{len(records)} registro(s) obtido(s) da API OpenCNPJ.")
+
+    result = run_transform_pipeline_opencnpj(records, warehouse_dir)
+    print(
+        f"{result.materialize_result.n_rows_written} lead(s) gravado(s), "
+        f"{result.materialize_result.n_rows_skipped} pulado(s) (schema inválido)."
+    )
+
+    if not result.activated:
+        print(
+            f"Validação de qualidade reprovada: {result.quality_report.failures}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        f"Versão ativada: {result.version_dir.name} "
+        f"({result.quality_report.n_rows} lead(s) no total)."
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Ponto de entrada de linha de comando."""
     if hasattr(sys.stdout, "reconfigure"):
@@ -385,6 +459,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "retention-purge":
         return run_retention_purge_command(args)
+
+    if args.command == "ingest":
+        return run_ingest_command(args.warehouse_dir, args)
 
     build_arg_parser().print_help()
     return 1

@@ -29,6 +29,13 @@ canônico) -> Storage (DuckDB/Parquet, tabela `leads` particionada por pais) -> 
 (filtros ICP, scoring, supressão) -> Enriquecimento (sob demanda, com cache) -> Export /
 Dashboard. Camada de compliance transversal (audit_log, retention, suppression).
 
+**Nota sobre a fonte BR**: `ingestion/br_receita/downloader.py` (URL oficial original de
+Dados Abertos CNPJ da Receita Federal) está com a URL desativada — o portal migrou de
+estrutura (SERPRO+) e o conector não foi atualizado ainda. Enquanto isso, `pais=BR` é
+populado por `ingestion/br_opencnpj/` (fonte alternativa: descoberta de CNPJs via sitemap
+público do cnpja.com + busca via API aberta/sem-autenticação do OpenCNPJ, dados oficiais da
+Receita Federal), acionado por `python cli.py ingest --fonte opencnpj --n N`.
+
 ## Schema canônico da tabela `leads`
 pais, id_legal, id_estab, razao_social, nome_fantasia, cod_atividade, situacao, regiao,
 municipio, cep, telefone, email, data_inicio_atividade, porte, capital_social,

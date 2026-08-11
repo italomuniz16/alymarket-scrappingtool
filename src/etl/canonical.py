@@ -10,20 +10,28 @@
   `etl/transform.materialize_leads_fr` — e devolve um dict validado contra
   `CanonicalLead`. `fonte="FR_SIRENE"`. **CRÍTICO**: `flag_difusao_restrita` reflete
   o `statut_diffusion` de qualquer um dos dois registros — ver docstring da função.
+- `map_opencnpj_to_canonical` (BR, fonte alternativa): recebe um registro bruto da
+  API pública do OpenCNPJ (`ingestion/br_opencnpj/client.py`) e devolve um dict
+  validado contra `CanonicalLead`. `fonte="BR_OPENCNPJ"`. Usada enquanto
+  `br_receita/downloader.py` (URL oficial original da Receita Federal) está
+  desativado — ver CLAUDE.md/histórico do projeto.
 
-Ambas: todo registro que passa por aqui é dado real (`is_synthetic=False` — nunca o
+Todas: todo registro que passa por aqui é dado real (`is_synthetic=False` — nunca o
 seed sintético de `src/seed/synthetic.py`).
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
+from datetime import date, datetime
 from typing import Any
 
 from src.ingestion.base import CanonicalLead
 
 FONTE_BR_RECEITA = "BR_RECEITA"
 FONTE_FR_SIRENE = "FR_SIRENE"
+FONTE_OPENCNPJ = "BR_OPENCNPJ"
 
 # Mesma convenção de valores usada em enrichment/providers.py
 # (map_recherche_entreprises_response) para o campo etat_administratif da API --
@@ -225,5 +233,77 @@ def map_unite_legale_etablissement_to_canonical(
         enriquecido_em=None,
         is_synthetic=False,
         flag_difusao_restrita=flag_difusao_restrita,
+    )
+    return lead.model_dump()
+
+
+# -- BR (OpenCNPJ — fonte alternativa) -------------------------------------------
+
+_NATUREZA_JURIDICA_CODE_SUFFIX_RE = re.compile(r"\s*\(\d+\)\s*$")
+
+
+def _only_digits(value: str | None) -> str | None:
+    if not value:
+        return None
+    digits = "".join(c for c in value if c.isdigit())
+    return digits or None
+
+
+def _parse_ddmmyyyy(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+
+def map_opencnpj_to_canonical(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Mapeia um registro bruto da API pública do OpenCNPJ (`kitana.opencnpj.com`,
+    sem autenticação, dados oficiais da Receita Federal — ver
+    `ingestion/br_opencnpj/client.py`) pro schema canônico da tabela `leads`.
+
+    Usada como fonte alternativa pra `pais=BR` enquanto `br_receita/downloader.py`
+    (URL oficial original da Receita Federal) está desativado — ver CLAUDE.md.
+    `cnaes`/`naturezaJuridica`/datas vêm em formatos diferentes do stock oficial
+    (`etl/transform.py` JOIN), daí este mapeamento separado em vez de reaproveitar
+    `map_estabelecimento_to_canonical`.
+
+    Raises:
+        pydantic.ValidationError: se o registro não tiver o mínimo exigido pelo
+            schema canônico (ex.: `razaoSocial` ausente). O chamador
+            (`etl/transform.materialize_leads_opencnpj`) deve pular e contar essas
+            linhas, não interromper a materialização.
+    """
+    cnpj = _only_digits(record.get("cnpj")) or ""
+    cnaes = record.get("cnaes") or []
+    primeiro_cnae = cnaes[0] if cnaes else {}
+    natureza_juridica = (
+        _NATUREZA_JURIDICA_CODE_SUFFIX_RE.sub("", record.get("naturezaJuridica") or "").strip()
+        or None
+    )
+
+    lead = CanonicalLead(
+        pais="BR",
+        id_legal=cnpj[:8],
+        id_estab=cnpj,
+        razao_social=record.get("razaoSocial") or "",
+        nome_fantasia=record.get("nomeFantasia") or None,
+        cod_atividade=_only_digits(primeiro_cnae.get("cnae")),
+        situacao=(record.get("situacaoCadastral") or "").upper() or None,
+        regiao=record.get("uf"),
+        municipio=record.get("municipio"),
+        cep=_only_digits(record.get("cep")),
+        telefone=_only_digits(record.get("telefone")),
+        email=(record.get("email") or "").lower() or None,
+        data_inicio_atividade=_parse_ddmmyyyy(record.get("dataInicioAtividades")),
+        porte=None,  # ausente da resposta da API
+        capital_social=record.get("capitalSocial"),
+        natureza_juridica=natureza_juridica,
+        score_icp=None,
+        fonte=FONTE_OPENCNPJ,
+        enriquecido_em=None,
+        is_synthetic=False,
+        flag_difusao_restrita=False,
     )
     return lead.model_dump()

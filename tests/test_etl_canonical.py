@@ -11,7 +11,9 @@ from pydantic import ValidationError
 from src.etl.canonical import (
     FONTE_BR_RECEITA,
     FONTE_FR_SIRENE,
+    FONTE_OPENCNPJ,
     map_estabelecimento_to_canonical,
+    map_opencnpj_to_canonical,
     map_unite_legale_etablissement_to_canonical,
 )
 
@@ -285,3 +287,78 @@ class TestFlagDifusaoRestrita:
         }
         lead = map_unite_legale_etablissement_to_canonical(unite_legale, FULL_ETABLISSEMENT)
         assert lead["flag_difusao_restrita"] is True
+
+
+# -- BR (OpenCNPJ) ----------------------------------------------------------------
+
+FULL_OPENCNPJ_RECORD = {
+    "cnpj": "00000000083208",
+    "situacaoCadastral": "Ativa",
+    "dataSituacaoCadastral": "03/11/2005",
+    "motivoSituacaoCadastral": "SEM MOTIVO",
+    "razaoSocial": "BANCO DO BRASIL SA",
+    "nomeFantasia": "PARAISO - SAO PAULO (SP)",
+    "dataInicioAtividades": "26/09/1974",
+    "matriz": "Não",
+    "naturezaJuridica": "Sociedade de Economia Mista (2038)",
+    "capitalSocial": 120000000000,
+    "email": "AGE1189@BB.COM.BR",
+    "telefone": "(11) 35550400",
+    "logradouro": "AVENIDA BERNARDINO DE CAMPOS",
+    "numero": "250",
+    "complemento": None,
+    "bairro": "PARAISO",
+    "municipio": "SAO PAULO",
+    "uf": "SP",
+    "cep": "04004-040",
+    "opcaoSimples": "N",
+    "opcaoMei": "N",
+    "cnaes": [
+        {"cnae": "64.22-1-00", "descricao": "Bancos múltiplos, com carteira comercial"},
+        {"cnae": "64.99-9-99", "descricao": "Outras atividades..."},
+    ],
+    "socios": [],
+}
+
+
+def test_opencnpj_maps_full_record() -> None:
+    lead = map_opencnpj_to_canonical(FULL_OPENCNPJ_RECORD)
+
+    assert lead["pais"] == "BR"
+    assert lead["id_legal"] == "00000000"
+    assert lead["id_estab"] == "00000000083208"
+    assert lead["razao_social"] == "BANCO DO BRASIL SA"
+    assert lead["nome_fantasia"] == "PARAISO - SAO PAULO (SP)"
+    assert lead["situacao"] == "ATIVA"
+    assert lead["regiao"] == "SP"
+    assert lead["municipio"] == "SAO PAULO"
+    assert lead["cep"] == "04004040"
+    assert lead["telefone"] == "1135550400"
+    assert lead["email"] == "age1189@bb.com.br"
+    assert lead["data_inicio_atividade"] == date(1974, 9, 26)
+    assert lead["capital_social"] == Decimal("120000000000")
+    assert lead["fonte"] == FONTE_OPENCNPJ
+    assert lead["is_synthetic"] is False
+    assert lead["flag_difusao_restrita"] is False
+
+
+def test_opencnpj_cod_atividade_strips_punctuation_from_first_cnae() -> None:
+    lead = map_opencnpj_to_canonical(FULL_OPENCNPJ_RECORD)
+    assert lead["cod_atividade"] == "6422100"
+
+
+def test_opencnpj_natureza_juridica_strips_trailing_code() -> None:
+    lead = map_opencnpj_to_canonical(FULL_OPENCNPJ_RECORD)
+    assert lead["natureza_juridica"] == "Sociedade de Economia Mista"
+
+
+def test_opencnpj_no_cnaes_leaves_cod_atividade_none() -> None:
+    record = {**FULL_OPENCNPJ_RECORD, "cnaes": []}
+    lead = map_opencnpj_to_canonical(record)
+    assert lead["cod_atividade"] is None
+
+
+def test_opencnpj_missing_razao_social_raises_validation_error() -> None:
+    record = {**FULL_OPENCNPJ_RECORD, "razaoSocial": None}
+    with pytest.raises(ValidationError):
+        map_opencnpj_to_canonical(record)

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +42,7 @@ from pydantic import ValidationError
 from src.etl.canonical import (
     SITUACAO_CADASTRAL_LABELS,
     map_estabelecimento_to_canonical,
+    map_opencnpj_to_canonical,
     map_unite_legale_etablissement_to_canonical,
 )
 from src.etl.loader import table_row_count
@@ -603,6 +605,128 @@ def run_transform_pipeline_fr(
     materialize_result = materialize_leads_fr(
         unite_legale_files, etablissement_files, version_dir, batch_size=batch_size
     )
+
+    owns_con = con is None
+    con = con or duckdb.connect(":memory:")
+    try:
+        quality_report = run_quality_checks(con, version_dir, thresholds=thresholds)
+    finally:
+        if owns_con:
+            con.close()
+
+    activated = False
+    if quality_report.passed:
+        activate_version(warehouse_dir, version_dir)
+        activated = True
+    else:
+        logger.warning(
+            "Validação de qualidade reprovada para %s, versão não ativada: %s",
+            version_dir.name,
+            quality_report.failures,
+        )
+
+    return PipelineResult(
+        version_dir=version_dir,
+        materialize_result=materialize_result,
+        quality_report=quality_report,
+        activated=activated,
+    )
+
+
+# -- BR via OpenCNPJ (fonte alternativa) -----------------------------------------
+
+
+def materialize_leads_opencnpj(
+    records: Iterable[Mapping[str, Any]],
+    version_dir: Path,
+    *,
+    batch_size: int = 5_000,
+) -> MaterializeResult:
+    """Mapeia e grava a tabela `leads` (partição `pais=BR/`) a partir de registros
+    já buscados na API do OpenCNPJ (`ingestion/br_opencnpj/client.py`) — fonte
+    alternativa a `materialize_leads` (que depende do download oficial da Receita
+    Federal, atualmente desativado — ver CLAUDE.md). Mesmo schema de saída
+    (`CANONICAL_PARQUET_SCHEMA`), lido pelo resto do pipeline sem distinção de
+    fonte (a distinção fica só na coluna `fonte`, ver `etl/canonical.FONTE_OPENCNPJ`).
+
+    `records` já vem em memória (não em arquivo, ao contrário de
+    `materialize_leads_fr`) — a API do OpenCNPJ é consultada uma vez por CNPJ, sem
+    endpoint em lote, então não há um "arquivo bruto" intermediário pra ler daqui.
+    """
+    partition_dir = version_dir / "pais=BR"
+    partition_dir.mkdir(parents=True, exist_ok=True)
+
+    n_written = 0
+    n_skipped = 0
+    part_files: list[Path] = []
+    batch: list[dict[str, Any]] = []
+    write_index = 0
+
+    def _flush() -> None:
+        nonlocal write_index, n_written
+        if not batch:
+            return
+        part_path = partition_dir / f"part-{write_index:05d}.parquet"
+        pl.DataFrame(batch, schema=CANONICAL_PARQUET_SCHEMA).write_parquet(part_path)
+        part_files.append(part_path)
+        n_written += len(batch)
+        write_index += 1
+        batch.clear()
+
+    for record in records:
+        try:
+            canonical = map_opencnpj_to_canonical(record)
+        except ValidationError as exc:
+            n_skipped += 1
+            logger.warning(
+                "Registro OpenCNPJ pulado (schema canônico inválido) para cnpj=%r: %s",
+                record.get("cnpj"),
+                exc,
+            )
+            continue
+        if canonical["capital_social"] is not None:
+            canonical["capital_social"] = float(canonical["capital_social"])
+        batch.append(canonical)
+        if len(batch) >= batch_size:
+            _flush()
+
+    _flush()
+
+    return MaterializeResult(
+        n_rows_written=n_written, n_rows_skipped=n_skipped, part_files=part_files
+    )
+
+
+def run_transform_pipeline_opencnpj(
+    records: Iterable[Mapping[str, Any]],
+    warehouse_dir: Path,
+    *,
+    con: duckdb.DuckDBPyConnection | None = None,
+    batch_size: int = 5_000,
+    thresholds: QualityThresholds | None = None,
+) -> PipelineResult:
+    """Orquestra o pipeline completo pro OpenCNPJ: materializa numa versão nova ->
+    valida qualidade -> ativa (blue/green) só se aprovado. Espelha
+    `run_transform_pipeline_fr`: só `pais=BR` é (re)materializado aqui, a partir de
+    `records` (já buscados por `ingestion/br_opencnpj`) — a versão nova parte de
+    uma cópia de `pais=FR` (se houver) da versão hoje ativa (ver
+    `copy_forward_active_version`), pra não apagar dados de outra fonte agendada
+    separadamente.
+
+    Args:
+        records: registros brutos já buscados (ver `ingestion.br_opencnpj.client.
+            OpenCnpjClient.fetch_many`).
+        warehouse_dir: raiz do warehouse.
+        con: conexão DuckDB pra `run_quality_checks`; default: `:memory:` própria.
+        batch_size: linhas por lote/arquivo Parquet.
+        thresholds: limites de qualidade; default: `QualityThresholds()`.
+
+    Returns:
+        `PipelineResult` — mesmo formato de `run_transform_pipeline`/`_fr`.
+    """
+    version_dir = new_version_dir(warehouse_dir)
+    copy_forward_active_version(warehouse_dir, version_dir, exclude_pais="BR")
+    materialize_result = materialize_leads_opencnpj(records, version_dir, batch_size=batch_size)
 
     owns_con = con is None
     con = con or duckdb.connect(":memory:")
