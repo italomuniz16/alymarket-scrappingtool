@@ -1,0 +1,13 @@
+# Dependências do dashboard Streamlit hospedado (src/dashboard/app.py + src/dashboard/data.py).
+#
+# Gerado a partir do grafo de imports real (não de `pip freeze`): ingestão, scheduler,
+# enriquecimento e seed sintético (httpx, tenacity, apscheduler, faker, python-dotenv)
+# rodam só localmente/via CLI e não são importados por este app — ver CLAUDE.md.
+#
+# Pins soltos (>=), sem pacotes específicos de SO (o host é Linux).
+
+streamlit>=1.35
+duckdb>=1.0
+polars>=1.0
+pydantic>=2.7
+openpyxl>=3.1
