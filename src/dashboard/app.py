@@ -62,6 +62,13 @@ SCHEDULER_STATE_PATH = Path(os.environ.get("SCHEDULER_STATE_PATH", str(DEFAULT_S
 
 SITUACOES = ("", "ATIVA", "BAIXADA", "SUSPENSA", "INAPTA", "NULA")
 
+# Content-Type de cada formato de exportação, pro botão "Baixar" do navegador (ver
+# _render_preview_and_tam) — sem isso o navegador não sabe que tipo de arquivo é.
+_EXPORT_MIME_TYPES = {
+    "csv": "text/csv",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
 # Tokens de cor/tipografia reutilizados no CSS abaixo e nos gráficos.
 _ACCENT_LIGHT = "#2a78d6"
 
@@ -292,7 +299,22 @@ def _render_preview_and_tam(
                 if result.n_exported == 0:
                     st.warning("Empresa suprimida (opt-out/duplicata) — nada exportado.")
                 else:
-                    st.success(f"Exportado para `{result.path}`.")
+                    st.success(f"{result.n_exported} lead exportado — arquivo pronto abaixo.")
+                    # `result.path` fica no disco do servidor (efêmero, especialmente
+                    # no deploy hospedado — inacessível pro usuário). O download real
+                    # é este botão: entrega os bytes pro navegador na hora. Não dá
+                    # pra automatizar num clique só sem reexportar (e gravar de novo
+                    # no audit_log) a cada rerun do app — st.download_button precisa
+                    # dos bytes já prontos ANTES de qualquer clique, então o gatilho
+                    # tem que continuar sendo o clique em "Exportar esta empresa".
+                    st.download_button(
+                        "⬇️ Baixar arquivo",
+                        data=result.path.read_bytes(),
+                        file_name=result.path.name,
+                        mime=_EXPORT_MIME_TYPES[formato_one],
+                        key="download_one_btn",
+                        width="stretch",
+                    )
 
 
 def _render_charts(con: duckdb.DuckDBPyConnection, criteria: ICPCriteria, demo_mode: bool) -> None:
