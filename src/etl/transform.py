@@ -37,8 +37,13 @@ import duckdb
 import polars as pl
 from pydantic import ValidationError
 
-from src.etl.canonical import SITUACAO_CADASTRAL_LABELS, map_estabelecimento_to_canonical
+from src.etl.canonical import (
+    SITUACAO_CADASTRAL_LABELS,
+    map_estabelecimento_to_canonical,
+    map_unite_legale_etablissement_to_canonical,
+)
 from src.etl.loader import table_row_count
+from src.ingestion.fr_sirene.parser import parse_etablissement, parse_unite_legale
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +217,103 @@ def materialize_leads(
     )
 
 
+def materialize_leads_fr(
+    unite_legale_files: list[Path],
+    etablissement_files: list[Path],
+    version_dir: Path,
+    *,
+    batch_size: int = 5_000,
+) -> MaterializeResult:
+    """Mapeia e grava a tabela `leads` (partição `pais=FR/`) a partir dos arquivos de
+    stock SIRENE já baixados (`ingestion/fr_sirene/stock_download.py`) — mesma
+    integração que `materialize_leads` faz pro BR: Parquet com
+    `CANONICAL_PARQUET_SCHEMA`, lido de volta pelo dashboard/segmentação/export sem
+    nenhuma mudança do lado deles (todos já leem `pais=*` genericamente).
+
+    Diferente de `materialize_leads` (BR, join SQL via DuckDB sobre tabelas de
+    staging já carregadas por `etl/loader.py`): aqui o join unidade legal <->
+    estabelecimento é feito em Python, por SIREN — ainda não existe um loader de
+    staging DuckDB equivalente pro FR (só `ingestion/fr_sirene/parser.py`, que
+    devolve dicts em streaming). O lado "unidade legal" é materializado inteiro num
+    dict em memória (é sempre bem menor que o de estabelecimentos — mesma assimetria
+    do LEFT JOIN BR, onde `staging_empresas` é o lado pequeno); o lado
+    "estabelecimento" continua em streaming, então isto não carrega a base inteira de
+    estabelecimentos na memória de uma vez. Em escala de produção (dezenas de milhões
+    de estabelecimentos) isso deveria migrar pra DuckDB, análogo a `etl/loader.py`
+    pro FR — fora do escopo desta tarefa.
+
+    Args:
+        unite_legale_files: arquivos `StockUniteLegale` (`.zip` ou `.csv` — ver
+            `ingestion/fr_sirene/parser.parse_unite_legale`).
+        etablissement_files: arquivos `StockEtablissement` (idem).
+        version_dir: diretório da versão (ver `new_version_dir`); `pais=FR/` é
+            criado dentro dele.
+        batch_size: linhas por lote/arquivo Parquet.
+
+    Returns:
+        `MaterializeResult` com contagem de linhas gravadas/puladas (inclusive
+        estabelecimentos "órfãos", sem unidade legal correspondente carregada) e os
+        arquivos gerados.
+    """
+    partition_dir = version_dir / "pais=FR"
+    partition_dir.mkdir(parents=True, exist_ok=True)
+
+    unite_legale_by_siren: dict[str, dict[str, Any]] = {}
+    for path in unite_legale_files:
+        for record in parse_unite_legale(path):
+            if record.get("siren"):
+                unite_legale_by_siren[record["siren"]] = record
+
+    n_written = 0
+    n_skipped = 0
+    part_files: list[Path] = []
+    batch: list[dict[str, Any]] = []
+    write_index = 0
+
+    def _flush() -> None:
+        nonlocal write_index, n_written
+        if not batch:
+            return
+        part_path = partition_dir / f"part-{write_index:05d}.parquet"
+        pl.DataFrame(batch, schema=CANONICAL_PARQUET_SCHEMA).write_parquet(part_path)
+        part_files.append(part_path)
+        n_written += len(batch)
+        write_index += 1
+        batch.clear()
+
+    for path in etablissement_files:
+        for etab_record in parse_etablissement(path):
+            unite_legale = unite_legale_by_siren.get(etab_record.get("siren") or "")
+            if unite_legale is None:
+                n_skipped += 1
+                logger.warning(
+                    "Estabelecimento órfão (sem unidade legal correspondente) siret=%r",
+                    etab_record.get("siret"),
+                )
+                continue
+            try:
+                canonical = map_unite_legale_etablissement_to_canonical(unite_legale, etab_record)
+            except ValidationError as exc:
+                n_skipped += 1
+                logger.warning(
+                    "Registro pulado (schema canônico inválido) para siret=%r: %s",
+                    etab_record.get("siret"),
+                    exc,
+                )
+                continue
+            if canonical["capital_social"] is not None:
+                canonical["capital_social"] = float(canonical["capital_social"])
+            batch.append(canonical)
+            if len(batch) >= batch_size:
+                _flush()
+
+    _flush()
+
+    return MaterializeResult(
+        n_rows_written=n_written, n_rows_skipped=n_skipped, part_files=part_files
+    )
+
+
 # -- Validação de qualidade pós-carga -----------------------------------------------
 
 _DEFAULT_NULL_CHECK_COLUMNS = (
@@ -276,7 +378,7 @@ def run_quality_checks(
     if n_rows > 0:
         check_columns = list(thresholds.max_null_ratio) or list(_DEFAULT_NULL_CHECK_COLUMNS)
         exprs = ", ".join(
-            f"sum(CASE WHEN \"{c}\" IS NULL THEN 1 ELSE 0 END)::DOUBLE / count(*) AS \"{c}\""
+            f'sum(CASE WHEN "{c}" IS NULL THEN 1 ELSE 0 END)::DOUBLE / count(*) AS "{c}"'
             for c in check_columns
         )
         row = con.execute(f"SELECT {exprs} FROM read_parquet('{glob}')").fetchone()

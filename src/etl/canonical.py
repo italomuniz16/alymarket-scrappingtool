@@ -1,22 +1,35 @@
-"""Mapeamento BR -> schema canônico (`CanonicalLead`, ver `src/ingestion/base.py`).
+"""Mapeamento BR e FR -> schema canônico (`CanonicalLead`, ver `src/ingestion/base.py`).
 
-A função principal, `map_estabelecimento_to_canonical`, recebe um registro já unido
-(estabelecimento + empresa + simples + lookups — produzido pelo JOIN de
-`etl/transform.py`) e devolve um dict validado contra `CanonicalLead`.
+- `map_estabelecimento_to_canonical` (BR): recebe um registro já unido
+  (estabelecimento + empresa + simples + lookups — produzido pelo JOIN de
+  `etl/transform.py`) e devolve um dict validado contra `CanonicalLead`.
+  `fonte="BR_RECEITA"`, `flag_difusao_restrita=False` sempre (conceito específico do
+  SIRENE francês — não existe para o Brasil).
+- `map_unite_legale_etablissement_to_canonical` (FR): recebe o par (unidade legal,
+  estabelecimento) já unido por SIREN — produzido por
+  `etl/transform.materialize_leads_fr` — e devolve um dict validado contra
+  `CanonicalLead`. `fonte="FR_SIRENE"`. **CRÍTICO**: `flag_difusao_restrita` reflete
+  o `statut_diffusion` de qualquer um dos dois registros — ver docstring da função.
 
-Constantes desta fonte: todo registro que passa por aqui é `pais="BR"`,
-`fonte="BR_RECEITA"`, `is_synthetic=False` (dado real, nunca o seed sintético de
-`src/seed/synthetic.py`) e `flag_difusao_restrita=False` (conceito específico do
-SIRENE francês — não existe para o Brasil).
+Ambas: todo registro que passa por aqui é dado real (`is_synthetic=False` — nunca o
+seed sintético de `src/seed/synthetic.py`).
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from src.ingestion.base import CanonicalLead
 
 FONTE_BR_RECEITA = "BR_RECEITA"
+FONTE_FR_SIRENE = "FR_SIRENE"
+
+# Mesma convenção de valores usada em enrichment/providers.py
+# (map_recherche_entreprises_response) para o campo etat_administratif da API --
+# duplicado aqui de propósito: o mapeamento canônico pertence à camada ETL, que não
+# deve importar de enrichment (camada rio abaixo no pipeline, ver CLAUDE.md).
+ETAT_ADMINISTRATIF_LABELS: dict[str, str] = {"A": "ATIVA", "F": "BAIXADA"}
 
 # Vocabulário fixo e pequeno (documentado no layout oficial da Receita) -- diferente
 # de CNAE/município/natureza jurídica, que são tabelas grandes tratadas como lookups
@@ -103,5 +116,114 @@ def map_estabelecimento_to_canonical(record: dict[str, Any]) -> dict[str, Any]:
         enriquecido_em=None,
         is_synthetic=False,
         flag_difusao_restrita=False,
+    )
+    return lead.model_dump()
+
+
+# -- FR (SIRENE) ----------------------------------------------------------------
+
+
+def _departamento_from_code_postal(code_postal: str | None) -> str | None:
+    """Aproxima o département a partir dos 2 primeiros dígitos do code postal — mesma
+    heurística de `enrichment/providers.py::_departamento_from_code_postal`
+    (duplicada de propósito, ver docstring do módulo).
+
+    Não existe campo "région"/"département" no arquivo de stock SIRENE — confirmado
+    contra o dessin de fichier oficial (ver `ingestion/fr_sirene/parser.py`); só é
+    derivável do endereço do estabelecimento.
+    """
+    if not code_postal or len(code_postal) < 2 or not code_postal[:2].isdigit():
+        return None
+    return code_postal[:2]
+
+
+def _compose_pessoa_fisica_nome(unite_legale: Mapping[str, Any]) -> str | None:
+    """Pra empresário individual (personne physique), `denominationUniteLegale` vem
+    vazio — o nome vem em nome/prenome separados (ver
+    `ingestion/fr_sirene/parser.parse_unite_legale`)."""
+    prenome = unite_legale.get("prenome_usual") or unite_legale.get("prenome_1")
+    nome = unite_legale.get("nome")
+    partes = [p for p in (prenome, nome) if p]
+    return " ".join(partes) or None
+
+
+def map_unite_legale_etablissement_to_canonical(
+    unite_legale: Mapping[str, Any], etablissement: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Mapeia um par (unidade legal, estabelecimento) — já unidos por SIREN, ver
+    `etl/transform.materialize_leads_fr` — pro schema canônico da tabela `leads`.
+
+    `unite_legale`/`etablissement` têm as chaves produzidas por
+    `ingestion/fr_sirene/parser.parse_unite_legale`/`parse_etablissement`.
+
+    Mapeamento: SIREN -> `id_legal`, SIRET -> `id_estab`, NAF (activité principale)
+    -> `cod_atividade`, état administratif -> `situacao` (códigos traduzidos via
+    `ETAT_ADMINISTRATIF_LABELS`, mesmo vocabulário de `enrichment/providers.py`),
+    région/commune -> `regiao`/`municipio` (région aproximado do code postal — não
+    há campo région no stock file, ver `_departamento_from_code_postal`).
+
+    Prioridade estabelecimento > unidade legal pros campos presentes nos dois
+    (`situacao`, `cod_atividade`, `nome_fantasia`, `data_inicio_atividade`): o
+    estabelecimento é a unidade operacional mais específica — mesmo padrão que
+    `map_estabelecimento_to_canonical` usa pro Brasil (estabelecimento antes de
+    empresa).
+
+    **CRÍTICO (compliance — ver CLAUDE.md, filtro hard de difusão restrita)**:
+    `flag_difusao_restrita` é `True` se QUALQUER um dos dois registros (unidade
+    legal OU estabelecimento) tiver `statut_diffusion` diferente de `"O"` — os
+    parsers já computam isso por registro (`ingestion/fr_sirene/parser._flag_restrita`);
+    aqui é sempre o OR dos dois, nunca só um dos lados, pra não deixar passar por
+    engano um par onde só a unidade legal (ou só o estabelecimento) está em
+    "diffusion partielle".
+
+    Raises:
+        pydantic.ValidationError: se o par não tiver o mínimo exigido pelo schema
+            canônico (ex.: nem denominação nem nome de pessoa física em
+            `unite_legale`) — o chamador (`etl/transform.materialize_leads_fr`) pula
+            e conta essas linhas, não interrompe a materialização.
+    """
+    situacao_codigo = etablissement.get("situacao") or unite_legale.get("situacao")
+    situacao = (
+        ETAT_ADMINISTRATIF_LABELS.get(situacao_codigo, situacao_codigo) if situacao_codigo else None
+    )
+
+    razao_social = (
+        unite_legale.get("razao_social") or _compose_pessoa_fisica_nome(unite_legale) or ""
+    )
+    nome_fantasia = (
+        etablissement.get("nome_fantasia")
+        or unite_legale.get("sigla")
+        or unite_legale.get("nome_fantasia")
+    )
+    cod_atividade = etablissement.get("cod_atividade") or unite_legale.get("cod_atividade")
+    data_inicio_atividade = etablissement.get("data_criacao") or unite_legale.get("data_criacao")
+
+    # CRÍTICO: OR dos dois lados, nunca só um -- ver docstring acima.
+    flag_difusao_restrita = bool(unite_legale.get("flag_difusao_restrita")) or bool(
+        etablissement.get("flag_difusao_restrita")
+    )
+
+    lead = CanonicalLead(
+        pais="FR",
+        id_legal=etablissement.get("siren") or unite_legale.get("siren") or "",
+        id_estab=etablissement.get("siret") or "",
+        razao_social=razao_social,
+        nome_fantasia=nome_fantasia,
+        cod_atividade=cod_atividade,
+        situacao=situacao,
+        regiao=_departamento_from_code_postal(etablissement.get("cep")),
+        municipio=etablissement.get("municipio"),
+        cep=etablissement.get("cep"),
+        telefone=None,
+        email=None,
+        data_inicio_atividade=data_inicio_atividade,
+        porte=unite_legale.get("categoria_empresa"),
+        capital_social=None,  # ausente do stock file -- só via enrichment sob demanda
+        natureza_juridica=unite_legale.get("natureza_juridica"),
+        score_icp=None,
+        fonte=FONTE_FR_SIRENE,
+        enriquecido_em=None,
+        is_synthetic=False,
+        flag_difusao_restrita=flag_difusao_restrita,
     )
     return lead.model_dump()
