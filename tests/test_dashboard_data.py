@@ -250,6 +250,21 @@ class TestRunExport:
         assert dest.exists()
         assert result.n_exported == 2  # ids 1 e 3 (regiao SP, exclui o synthetic)
 
+    def test_exports_txt(self, leads_con: Con, tmp_path: Path) -> None:
+        dest = tmp_path / "out.txt"
+        result = run_export(
+            leads_con,
+            ICPCriteria(regiao="SP"),
+            suppression=SuppressionList(),
+            dest=dest,
+            formato="txt",
+            demo=False,
+            audit_log_path=tmp_path / "audit.parquet",
+        )
+        assert dest.exists()
+        assert result.n_exported == 2
+        assert "Razão social:" in dest.read_text(encoding="utf-8")
+
 
 class TestRunExportOne:
     def test_raises_when_demo_true(self, leads_con: Con, tmp_path: Path) -> None:
@@ -342,6 +357,21 @@ class TestRunExportOne:
         )
 
         assert result.n_exported == 0
+
+    def test_exports_txt(self, leads_con: Con, tmp_path: Path) -> None:
+        dest = tmp_path / "out.txt"
+        result = run_export_one(
+            leads_con,
+            ICPCriteria(),
+            id_estab="2",
+            suppression=SuppressionList(),
+            dest=dest,
+            formato="txt",
+            demo=False,
+        )
+
+        assert result.n_exported == 1
+        assert "Razão social:" in dest.read_text(encoding="utf-8")
 
 
 class TestRunIngestOpencnpj:

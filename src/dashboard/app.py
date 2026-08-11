@@ -67,6 +67,7 @@ SITUACOES = ("", "ATIVA", "BAIXADA", "SUSPENSA", "INAPTA", "NULA")
 _EXPORT_MIME_TYPES = {
     "csv": "text/csv",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "txt": "text/plain",
 }
 
 # Tokens de cor/tipografia reutilizados no CSS abaixo e nos gráficos.
@@ -276,7 +277,7 @@ def _render_preview_and_tam(
 
         col_fmt, col_btn = st.columns([2, 1])
         formato_one = col_fmt.radio(
-            "Formato", ["csv", "xlsx"], horizontal=True, key="formato_one"
+            "Formato", ["csv", "xlsx", "txt"], horizontal=True, key="formato_one"
         )
         col_btn.write("")
         if col_btn.button("Exportar esta empresa", key="export_one_btn", width="stretch"):
@@ -360,7 +361,7 @@ def _render_export(
         st.caption("Exportação desabilitada em modo demonstração — desligue o modo para exportar.")
         return
 
-    formato = st.radio("Formato", ["csv", "xlsx"], horizontal=True)
+    formato = st.radio("Formato", ["csv", "xlsx", "txt"], horizontal=True)
     usuario = st.text_input("Usuário (para auditoria)", value="")
 
     if st.button("Exportar"):

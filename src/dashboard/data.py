@@ -23,7 +23,7 @@ import duckdb
 
 from src.etl.canonical import FONTE_BR_RECEITA, FONTE_FR_SIRENE
 from src.etl.transform import PipelineResult, get_active_leads_dir
-from src.export.exporters import ExportResult, export_csv, export_xlsx
+from src.export.exporters import ExportResult, export_csv, export_txt, export_xlsx
 from src.scheduler.pipelines import collect_opencnpj_leads
 from src.scheduler.state import DEFAULT_STATE_PATH, load_state
 from src.segmentation.filters import (
@@ -45,6 +45,11 @@ from src.segmentation.filters import (
 from src.segmentation.suppression import SuppressionList, apply_suppression_gate
 
 DEMO_LABEL = "DADOS FICTÍCIOS — DEMONSTRAÇÃO"
+
+# Formatos de exportação suportados pelo dashboard (run_export/run_export_one) --
+# "txt" é organizado por bloco (Rótulo: valor), pensado pra leitura humana; ver
+# export/exporters.export_txt.
+EXPORTERS = {"csv": export_csv, "xlsx": export_xlsx, "txt": export_txt}
 
 
 class DemoExportBlockedError(RuntimeError):
@@ -289,21 +294,21 @@ def run_export(
     Raises:
         DemoExportBlockedError: se `demo=True` — exportação nunca roda em modo
             demonstração (a UI já desabilita o botão nesse caso; isto é reforço).
-        ValueError: `formato` diferente de `"csv"`/`"xlsx"`.
+        ValueError: `formato` fora de `EXPORTERS` (`"csv"`/`"xlsx"`/`"txt"`).
     """
     if demo:
         raise DemoExportBlockedError(
             "Exportação bloqueada: modo demonstração está ativo. "
             "Desative o modo demonstração para exportar dados reais."
         )
-    if formato not in {"csv", "xlsx"}:
+    if formato not in EXPORTERS:
         raise ValueError(f"Formato de exportação desconhecido: {formato!r}")
 
     built = build_export_query(criteria, source=source, order_by=None, limit=None)
     rows = _fetch_dicts(con, built.select_sql, built.params)
     filtros = criteria_to_filtros_dict(criteria)
 
-    exportar = export_csv if formato == "csv" else export_xlsx
+    exportar = EXPORTERS[formato]
     kwargs: dict[str, Any] = {
         "suppression": suppression,
         "filtros": filtros,
@@ -338,17 +343,17 @@ def run_export_one(
 
     Raises:
         DemoExportBlockedError: mesma regra de `run_export`.
-        ValueError: `formato` diferente de `"csv"`/`"xlsx"`, ou `id_estab` não
-            encontrado sob `criteria` (ex.: a linha saiu do conjunto por uma
-            mudança de filtro entre o preview e o clique — erro de uso, não de
-            sistema).
+        ValueError: `formato` fora de `EXPORTERS` (`"csv"`/`"xlsx"`/`"txt"`), ou
+            `id_estab` não encontrado sob `criteria` (ex.: a linha saiu do
+            conjunto por uma mudança de filtro entre o preview e o clique — erro
+            de uso, não de sistema).
     """
     if demo:
         raise DemoExportBlockedError(
             "Exportação bloqueada: modo demonstração está ativo. "
             "Desative o modo demonstração para exportar dados reais."
         )
-    if formato not in {"csv", "xlsx"}:
+    if formato not in EXPORTERS:
         raise ValueError(f"Formato de exportação desconhecido: {formato!r}")
 
     built = build_export_query(criteria, source=source, order_by=None, limit=None)
@@ -360,7 +365,7 @@ def run_export_one(
     filtros = criteria_to_filtros_dict(criteria)
     filtros["id_estab"] = id_estab
 
-    exportar = export_csv if formato == "csv" else export_xlsx
+    exportar = EXPORTERS[formato]
     kwargs: dict[str, Any] = {
         "suppression": suppression,
         "filtros": filtros,

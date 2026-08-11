@@ -13,7 +13,7 @@ import pytest
 from openpyxl import load_workbook
 
 from src.compliance.audit_log import read_audit_log
-from src.export.exporters import EXPORT_COLUMNS, ExportError, export_csv, export_xlsx
+from src.export.exporters import EXPORT_COLUMNS, ExportError, export_csv, export_txt, export_xlsx
 from src.segmentation.suppression import SuppressionList
 
 
@@ -45,6 +45,16 @@ def _lead(**overrides: object) -> dict[str, object]:
 
 
 NO_SUPPRESSION = SuppressionList()
+
+
+def _txt_field(text: str, label: str) -> str:
+    """Valor de um campo `Rótulo: valor` no texto exportado -- não usa a string
+    inteira porque `_write_txt` alinha os rótulos (padding variável entre `:` e o
+    valor, ver export/exporters._write_txt)."""
+    for line in text.splitlines():
+        if line.startswith(f"{label}:"):
+            return line.split(":", 1)[1].strip()
+    raise AssertionError(f"campo {label!r} não encontrado no texto exportado")
 
 
 class TestSuppressionGateOnExportCsv:
@@ -209,6 +219,92 @@ class TestExportXlsxContent:
         assert len(rows) == 2  # cabeçalho + 1 lead
 
 
+class TestExportTxtContent:
+    def test_gate_applies_to_txt_too(self, tmp_path: Path) -> None:
+        leads = [_lead(id_estab="ok"), _lead(id_estab="synth", is_synthetic=True)]
+        dest = tmp_path / "out.txt"
+
+        result = export_txt(
+            leads, dest, suppression=NO_SUPPRESSION, audit_log_path=tmp_path / "audit.parquet"
+        )
+
+        assert result.n_exported == 1
+        text = dest.read_text(encoding="utf-8")
+        assert text.count("=" * 80) == 2  # uma divisória de abertura + uma de fechamento, 1 lead
+        assert "synth" not in text
+
+    def test_block_contains_every_column_as_labeled_line(self, tmp_path: Path) -> None:
+        dest = tmp_path / "out.txt"
+        export_txt(
+            [_lead(razao_social="ACME LTDA")],
+            dest,
+            suppression=NO_SUPPRESSION,
+            audit_log_path=tmp_path / "audit.parquet",
+        )
+
+        text = dest.read_text(encoding="utf-8")
+        assert "ACME LTDA" in text
+        assert _txt_field(text, "Razão social") == "ACME LTDA"
+        assert _txt_field(text, "CNPJ / SIRET") == "11111111000191"
+        assert _txt_field(text, "E-mail") == "contato@empresateste.com.br"
+        assert _txt_field(text, "Fonte") == "BR_RECEITA"
+
+    def test_missing_value_rendered_as_dash(self, tmp_path: Path) -> None:
+        dest = tmp_path / "out.txt"
+        export_txt(
+            [_lead(nome_fantasia=None)],
+            dest,
+            suppression=NO_SUPPRESSION,
+            audit_log_path=tmp_path / "audit.parquet",
+        )
+
+        text = dest.read_text(encoding="utf-8")
+        assert _txt_field(text, "Nome fantasia") == "—"
+
+    def test_multiple_leads_get_separate_blocks(self, tmp_path: Path) -> None:
+        # E-mails de domínios diferentes -- domínio igual dispara
+        # dedupe_by_email_domain (ver segmentation/suppression.py) e colapsaria os
+        # dois leads em um só, o que não é o que este teste quer exercitar.
+        dest = tmp_path / "out.txt"
+        export_txt(
+            [
+                _lead(id_estab="A", razao_social="EMPRESA A", email="a@empresaa.com"),
+                _lead(id_estab="B", razao_social="EMPRESA B", email="b@empresab.com"),
+            ],
+            dest,
+            suppression=NO_SUPPRESSION,
+            audit_log_path=tmp_path / "audit.parquet",
+        )
+
+        text = dest.read_text(encoding="utf-8")
+        assert text.count("=" * 80) == 4  # 2 divisórias por lead, 2 leads
+        assert "EMPRESA A" in text
+        assert "EMPRESA B" in text
+
+    def test_empty_after_suppression_still_writes_a_file(self, tmp_path: Path) -> None:
+        dest = tmp_path / "out.txt"
+        result = export_txt(
+            [_lead(is_synthetic=True)],
+            dest,
+            suppression=NO_SUPPRESSION,
+            audit_log_path=tmp_path / "audit.parquet",
+        )
+
+        assert result.n_exported == 0
+        assert dest.exists()
+        assert "=" not in dest.read_text(encoding="utf-8")
+
+    def test_no_columns_raises_export_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ExportError):
+            export_txt(
+                [_lead()],
+                tmp_path / "out.txt",
+                suppression=NO_SUPPRESSION,
+                columns=[],
+                audit_log_path=tmp_path / "audit.parquet",
+            )
+
+
 class TestAuditLogIntegration:
     def test_export_records_audit_event_before_returning(self, tmp_path: Path) -> None:
         dest = tmp_path / "out.csv"
@@ -251,6 +347,15 @@ class TestAuditLogIntegration:
 
         row = read_audit_log(audit_path).to_dicts()[0]
         assert row["operacao"] == "export_xlsx"
+
+    def test_txt_export_uses_distinct_operacao(self, tmp_path: Path) -> None:
+        audit_path = tmp_path / "audit.parquet"
+        export_txt(
+            [_lead()], tmp_path / "out.txt", suppression=NO_SUPPRESSION, audit_log_path=audit_path
+        )
+
+        row = read_audit_log(audit_path).to_dicts()[0]
+        assert row["operacao"] == "export_txt"
 
     def test_multiple_exports_accumulate_in_the_log(self, tmp_path: Path) -> None:
         audit_path = tmp_path / "audit.parquet"

@@ -1,11 +1,11 @@
-"""Exportação de listas de leads para CSV/Excel — sempre passando pelo portão de
-supressão (`segmentation/suppression.py`) e registrando a operação no `audit_log`
+"""Exportação de listas de leads para CSV/Excel/texto — sempre passando pelo portão
+de supressão (`segmentation/suppression.py`) e registrando a operação no `audit_log`
 antes de escrever qualquer arquivo de saída (ver CLAUDE.md: "registro de tratamento",
 "trilha de conformidade").
 
 ## Nunca exporta sem passar pela supressão
 
-`export_csv`/`export_xlsx` chamam `apply_suppression_gate` internamente, sempre —
+`export_csv`/`export_xlsx`/`export_txt` chamam `apply_suppression_gate` internamente, sempre —
 não existe parâmetro para pular essa etapa nem para escrever direto a partir de
 `leads` sem gate. Isso cobre, de novo, as exclusões hard (`is_synthetic`,
 `flag_difusao_restrita`), a deduplicação e a lista de opt-out — ver
@@ -60,6 +60,30 @@ EXPORT_COLUMNS: tuple[str, ...] = (
     "enriquecido_em",
 )
 
+# Rótulos legíveis (pt-BR) por coluna, usados só por `_write_txt` -- as colunas sem
+# entrada aqui (não deveria acontecer, mas por segurança) caem no nome bruto.
+_TXT_FIELD_LABELS: dict[str, str] = {
+    "pais": "País",
+    "id_legal": "CNPJ básico / SIREN",
+    "id_estab": "CNPJ / SIRET",
+    "razao_social": "Razão social",
+    "nome_fantasia": "Nome fantasia",
+    "cod_atividade": "Atividade (CNAE/NAF)",
+    "situacao": "Situação",
+    "regiao": "Região",
+    "municipio": "Município",
+    "cep": "CEP",
+    "telefone": "Telefone",
+    "email": "E-mail",
+    "data_inicio_atividade": "Início de atividade",
+    "porte": "Porte",
+    "capital_social": "Capital social",
+    "natureza_juridica": "Natureza jurídica",
+    "score_icp": "Score ICP",
+    "fonte": "Fonte",
+    "enriquecido_em": "Enriquecido em",
+}
+
 
 class ExportError(RuntimeError):
     """Levantado para um uso inválido da exportação (ex.: nenhuma coluna a exportar)."""
@@ -93,6 +117,28 @@ def _write_xlsx(rows: list[dict[str, Any]], dest: Path, columns: Sequence[str]) 
     for row in rows:
         sheet.append([row.get(col) for col in columns])
     workbook.save(dest)
+
+
+def _write_txt(rows: list[dict[str, Any]], dest: Path, columns: Sequence[str]) -> None:
+    """Um bloco por lead (divisória + razão social + campos `Rótulo: valor`, um por
+    linha, rótulos alinhados) -- pensado pra leitura direta por humano, não pra
+    reimportação em planilha (isso já é o papel de `_write_csv`/`_write_xlsx`)."""
+    labels = [_TXT_FIELD_LABELS.get(col, col) for col in columns]
+    label_width = max((len(label) for label in labels), default=0) + 1  # +1 pelo ":"
+
+    lines: list[str] = [f"alymarket — leads exportados ({len(rows)})", ""]
+    for row in rows:
+        titulo = str(row.get("razao_social") or "(sem razão social)")
+        lines.append("=" * 80)
+        lines.append(titulo)
+        lines.append("=" * 80)
+        for col, label in zip(columns, labels, strict=True):
+            value = row.get(col)
+            display = "—" if value in (None, "") else str(value)
+            lines.append(f"{label + ':':<{label_width}} {display}")
+        lines.append("")
+
+    dest.write_text("\n".join(lines), encoding="utf-8")
 
 
 _Writer = Callable[[list[dict[str, Any]], Path, Sequence[str]], None]
@@ -191,6 +237,35 @@ def export_xlsx(
         suppression=suppression,
         operacao="export_xlsx",
         writer=_write_xlsx,
+        filtros=filtros,
+        usuario=usuario,
+        audit_log_path=audit_log_path,
+        columns=columns,
+    )
+
+
+def export_txt(
+    leads: Iterable[Mapping[str, Any]],
+    dest: Path | str,
+    *,
+    suppression: SuppressionList,
+    filtros: Mapping[str, Any] | None = None,
+    usuario: str | None = None,
+    audit_log_path: Path | str = DEFAULT_AUDIT_LOG_PATH,
+    columns: Sequence[str] = EXPORT_COLUMNS,
+) -> ExportResult:
+    """Exporta `leads` para texto (`.txt`) em `dest`: um bloco organizado por lead
+    (`Rótulo: valor`, um campo por linha, rótulos alinhados e em português — ver
+    `_TXT_FIELD_LABELS`), pensado pra leitura direta por humano (ex.: colar num
+    e-mail, imprimir), não pra reimportação em planilha. Mesmo contrato de
+    `export_csv` (portão de supressão + registro em audit_log sempre, antes de
+    escrever)."""
+    return _export(
+        leads,
+        dest,
+        suppression=suppression,
+        operacao="export_txt",
+        writer=_write_txt,
         filtros=filtros,
         usuario=usuario,
         audit_log_path=audit_log_path,
