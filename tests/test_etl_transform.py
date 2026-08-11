@@ -22,6 +22,7 @@ from src.etl.transform import (
     QualityThresholds,
     activate_version,
     build_joined_relation,
+    copy_forward_active_version,
     get_active_leads_dir,
     get_active_version,
     load_lookup_table_into_duckdb,
@@ -332,6 +333,110 @@ class TestBlueGreenVersioning:
         v1 = new_version_dir(tmp_path)
         v2 = new_version_dir(tmp_path)
         assert v1 != v2
+
+
+class TestCopyForwardActiveVersion:
+    def test_no_active_version_returns_empty_and_copies_nothing(self, tmp_path: Path) -> None:
+        warehouse_dir = tmp_path / "warehouse"
+        version_dir = tmp_path / "versions" / "v1"
+        version_dir.mkdir(parents=True)
+
+        copied = copy_forward_active_version(warehouse_dir, version_dir, exclude_pais="BR")
+
+        assert copied == []
+        assert list(version_dir.iterdir()) == []
+
+    def test_copies_other_countries_but_not_excluded(self, tmp_path: Path) -> None:
+        warehouse_dir = tmp_path / "warehouse"
+        active = new_version_dir(warehouse_dir)
+        (active / "pais=BR").mkdir(parents=True)
+        (active / "pais=BR" / "part-00000.parquet").write_bytes(b"br-data")
+        (active / "pais=FR").mkdir(parents=True)
+        (active / "pais=FR" / "part-00000.parquet").write_bytes(b"fr-data")
+        activate_version(warehouse_dir, active)
+
+        new_version = new_version_dir(warehouse_dir)
+        new_version.mkdir(parents=True)
+        copied = copy_forward_active_version(warehouse_dir, new_version, exclude_pais="BR")
+
+        assert copied == ["FR"]
+        assert (new_version / "pais=FR" / "part-00000.parquet").read_bytes() == b"fr-data"
+        assert not (new_version / "pais=BR").exists()  # excluído -- não copiado
+
+    def test_does_not_overwrite_a_partition_already_present(self, tmp_path: Path) -> None:
+        warehouse_dir = tmp_path / "warehouse"
+        active = new_version_dir(warehouse_dir)
+        (active / "pais=FR").mkdir(parents=True)
+        (active / "pais=FR" / "part-00000.parquet").write_bytes(b"fr-antigo")
+        activate_version(warehouse_dir, active)
+
+        new_version = new_version_dir(warehouse_dir)
+        (new_version / "pais=FR").mkdir(parents=True)
+        (new_version / "pais=FR" / "part-00000.parquet").write_bytes(b"fr-ja-materializado-agora")
+
+        copied = copy_forward_active_version(warehouse_dir, new_version, exclude_pais="BR")
+
+        assert copied == []
+        assert (
+            new_version / "pais=FR" / "part-00000.parquet"
+        ).read_bytes() == b"fr-ja-materializado-agora"
+
+
+_FR_ROW: dict[str, object] = {
+    "pais": "FR",
+    "id_legal": "123456789",
+    "id_estab": "12345678900015",
+    "razao_social": "EMPRESA FRANCESA",
+    "nome_fantasia": None,
+    "cod_atividade": "62.01Z",
+    "situacao": "ATIVA",
+    "regiao": "75",
+    "municipio": "PARIS",
+    "cep": "75001",
+    "telefone": None,
+    "email": None,
+    "data_inicio_atividade": None,
+    "porte": None,
+    "capital_social": None,
+    "natureza_juridica": None,
+    "score_icp": None,
+    "fonte": "FR_SIRENE",
+    "enriquecido_em": None,
+    "is_synthetic": False,
+    "flag_difusao_restrita": False,
+}
+
+
+class TestRunTransformPipelinePreservesOtherSources:
+    def test_br_run_preserves_existing_fr_partition(self, tmp_path: Path) -> None:
+        """O caso real que copy_forward_active_version existe pra evitar: rodar o
+        pipeline BR não pode apagar dados FR de uma rodada anterior/agendada
+        separadamente (ver src/scheduler/)."""
+        con = _load_con(tmp_path)
+        warehouse_dir = tmp_path / "warehouse"
+
+        # Simula uma versão ativa anterior com dado FR (ex.: de uma rodada do
+        # scheduler FR que já rodou antes desta rodada BR).
+        pre_existing = new_version_dir(warehouse_dir)
+        fr_partition = pre_existing / "pais=FR"
+        fr_partition.mkdir(parents=True)
+        pl.DataFrame([_FR_ROW], schema=CANONICAL_PARQUET_SCHEMA).write_parquet(
+            fr_partition / "part-00000.parquet"
+        )
+        activate_version(warehouse_dir, pre_existing)
+
+        result = run_transform_pipeline(
+            con,
+            warehouse_dir,
+            municipio_lookup_csv=MUNICIPIO_LOOKUP_CSV,
+            natureza_juridica_lookup_csv=NATUREZA_JURIDICA_LOOKUP_CSV,
+        )
+
+        assert result.activated
+        assert (result.version_dir / "pais=BR").exists()
+        df = pl.read_parquet((result.version_dir / "pais=FR").as_posix() + "/*.parquet")
+        assert df.height == 1
+        assert df["id_estab"].to_list() == ["12345678900015"]
 
 
 class TestRunTransformPipeline:

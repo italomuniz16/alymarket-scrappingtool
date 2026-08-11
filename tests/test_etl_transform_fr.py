@@ -12,7 +12,15 @@ from pathlib import Path
 
 import polars as pl
 
-from src.etl.transform import CANONICAL_PARQUET_SCHEMA, materialize_leads_fr
+from src.etl.transform import (
+    CANONICAL_PARQUET_SCHEMA,
+    QualityThresholds,
+    activate_version,
+    get_active_version,
+    materialize_leads_fr,
+    new_version_dir,
+    run_transform_pipeline_fr,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 UNITE_LEGALE_CSV = FIXTURES / "fr_sirene_unitelegale_sample.csv"
@@ -92,3 +100,86 @@ class TestMaterializeLeadsFr:
 
         assert result.n_rows_written == 0
         assert result.part_files == []
+
+
+class TestRunTransformPipelineFr:
+    def test_activates_on_success(self, tmp_path: Path) -> None:
+        warehouse_dir = tmp_path / "warehouse"
+
+        result = run_transform_pipeline_fr([UNITE_LEGALE_CSV], [ETABLISSEMENT_CSV], warehouse_dir)
+
+        assert result.activated
+        assert result.quality_report.passed
+        assert result.materialize_result.n_rows_written == 3
+        assert get_active_version(warehouse_dir) == result.version_dir.name
+
+        df = pl.read_parquet((result.version_dir / "pais=FR").as_posix() + "/*.parquet")
+        assert df.height == 3
+        assert set(df["fonte"].unique().to_list()) == {"FR_SIRENE"}
+
+    def test_does_not_activate_on_quality_failure(self, tmp_path: Path) -> None:
+        warehouse_dir = tmp_path / "warehouse"
+
+        result = run_transform_pipeline_fr(
+            [UNITE_LEGALE_CSV],
+            [ETABLISSEMENT_CSV],
+            warehouse_dir,
+            thresholds=QualityThresholds(min_rows=100),
+        )
+
+        assert not result.activated
+        assert not result.quality_report.passed
+        assert get_active_version(warehouse_dir) is None
+
+    def test_preserves_existing_br_partition(self, tmp_path: Path) -> None:
+        """Espelho do teste equivalente do lado BR: rodar o pipeline FR não pode
+        apagar dados BR de uma rodada agendada separadamente (ver src/scheduler/)."""
+        warehouse_dir = tmp_path / "warehouse"
+        br_row: dict[str, object] = {
+            "pais": "BR",
+            "id_legal": "11111111",
+            "id_estab": "11111111000191",
+            "razao_social": "EMPRESA BRASILEIRA",
+            "nome_fantasia": None,
+            "cod_atividade": "8630501",
+            "situacao": "ATIVA",
+            "regiao": "SP",
+            "municipio": "SAO PAULO",
+            "cep": None,
+            "telefone": None,
+            "email": None,
+            "data_inicio_atividade": None,
+            "porte": None,
+            "capital_social": None,
+            "natureza_juridica": None,
+            "score_icp": None,
+            "fonte": "BR_RECEITA",
+            "enriquecido_em": None,
+            "is_synthetic": False,
+            "flag_difusao_restrita": False,
+        }
+        pre_existing = new_version_dir(warehouse_dir)
+        br_partition = pre_existing / "pais=BR"
+        br_partition.mkdir(parents=True)
+        pl.DataFrame([br_row], schema=CANONICAL_PARQUET_SCHEMA).write_parquet(
+            br_partition / "part-00000.parquet"
+        )
+        activate_version(warehouse_dir, pre_existing)
+
+        result = run_transform_pipeline_fr([UNITE_LEGALE_CSV], [ETABLISSEMENT_CSV], warehouse_dir)
+
+        assert result.activated
+        assert (result.version_dir / "pais=FR").exists()
+        df = pl.read_parquet((result.version_dir / "pais=BR").as_posix() + "/*.parquet")
+        assert df.height == 1
+        assert df["id_estab"].to_list() == ["11111111000191"]
+
+    def test_second_run_replaces_pointer_without_deleting_first(self, tmp_path: Path) -> None:
+        warehouse_dir = tmp_path / "warehouse"
+
+        first = run_transform_pipeline_fr([UNITE_LEGALE_CSV], [ETABLISSEMENT_CSV], warehouse_dir)
+        second = run_transform_pipeline_fr([UNITE_LEGALE_CSV], [ETABLISSEMENT_CSV], warehouse_dir)
+
+        assert first.version_dir != second.version_dir
+        assert get_active_version(warehouse_dir) == second.version_dir.name
+        assert first.version_dir.exists()

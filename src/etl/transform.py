@@ -28,6 +28,7 @@ de versão blue/green.
 from __future__ import annotations
 
 import logging
+import shutil
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -456,6 +457,57 @@ def activate_version(warehouse_dir: Path, version_dir: Path) -> None:
     logger.info("Versão ativada: %s", version_dir.name)
 
 
+def copy_forward_active_version(
+    warehouse_dir: Path, version_dir: Path, *, exclude_pais: str
+) -> list[str]:
+    """Copia pra `version_dir` as partições `pais=X` da versão hoje ativa, exceto
+    `pais={exclude_pais}` (a fonte que a rodada atual está prestes a (re)materializar).
+
+    Necessário porque BR e FR são agendados de forma independente, em cadências
+    diferentes (ver `src/scheduler/`): sem isso, uma rodada da Receita Federal (que
+    só toca `pais=BR`) criaria uma versão nova só com `pais=BR` e, ao ativá-la,
+    apagaria de vista os dados franceses que a última rodada do SIRENE tinha
+    materializado (e vice-versa) — blue/green por fonte precisa preservar as fontes
+    que não fazem parte da rodada atual.
+
+    Sem versão ativa ainda (a primeiríssima rodada de todas, de qualquer fonte), não
+    há nada pra copiar — retorna lista vazia, sem erro.
+
+    Args:
+        warehouse_dir: raiz do warehouse (ver `get_active_leads_dir`).
+        version_dir: a versão nova (ainda sendo montada) pra onde copiar.
+        exclude_pais: código do país que a rodada atual já vai (re)escrever — nunca
+            copiado daqui (evita copiar dado velho por cima do que já for
+            materializado nesta mesma rodada, independente da ordem de chamada).
+
+    Returns:
+        Códigos de país efetivamente copiados (ex.: `["FR"]`).
+    """
+    active_dir = get_active_leads_dir(warehouse_dir)
+    if active_dir is None:
+        return []
+
+    copied: list[str] = []
+    for partition_dir in sorted(active_dir.glob("pais=*")):
+        pais = partition_dir.name.removeprefix("pais=")
+        if pais == exclude_pais:
+            continue
+        dest = version_dir / partition_dir.name
+        if dest.exists():
+            continue
+        shutil.copytree(partition_dir, dest)
+        copied.append(pais)
+
+    if copied:
+        logger.info(
+            "Partições copiadas da versão ativa (%s) pra %s: %s",
+            active_dir.name,
+            version_dir.name,
+            copied,
+        )
+    return copied
+
+
 @dataclass(frozen=True)
 class PipelineResult:
     """Resultado de uma execução completa do pipeline de transform."""
@@ -480,13 +532,85 @@ def run_transform_pipeline(
 
     Pressupõe que `con` já tem `staging_estabelecimentos`/`staging_empresas`/
     `staging_simples` carregadas (ver `etl/loader.load_staging_directory`).
+
+    A versão nova parte de uma cópia das partições de OUTRAS fontes (ex.: `pais=FR`)
+    da versão hoje ativa (ver `copy_forward_active_version`) — só `pais=BR` é
+    (re)materializado aqui; sem a cópia, ativar esta versão apagaria dados de fontes
+    agendadas separadamente (ver `src/scheduler/`).
     """
     load_lookup_table_into_duckdb(con, municipio_lookup_csv, LOOKUP_MUNICIPIO)
     load_lookup_table_into_duckdb(con, natureza_juridica_lookup_csv, LOOKUP_NATUREZA_JURIDICA)
 
     version_dir = new_version_dir(warehouse_dir)
+    copy_forward_active_version(warehouse_dir, version_dir, exclude_pais="BR")
     materialize_result = materialize_leads(con, version_dir, batch_size=batch_size)
     quality_report = run_quality_checks(con, version_dir, thresholds=thresholds)
+
+    activated = False
+    if quality_report.passed:
+        activate_version(warehouse_dir, version_dir)
+        activated = True
+    else:
+        logger.warning(
+            "Validação de qualidade reprovada para %s, versão não ativada: %s",
+            version_dir.name,
+            quality_report.failures,
+        )
+
+    return PipelineResult(
+        version_dir=version_dir,
+        materialize_result=materialize_result,
+        quality_report=quality_report,
+        activated=activated,
+    )
+
+
+def run_transform_pipeline_fr(
+    unite_legale_files: list[Path],
+    etablissement_files: list[Path],
+    warehouse_dir: Path,
+    *,
+    con: duckdb.DuckDBPyConnection | None = None,
+    batch_size: int = 5_000,
+    thresholds: QualityThresholds | None = None,
+) -> PipelineResult:
+    """Orquestra o pipeline completo pro FR: materializa numa versão nova -> valida
+    qualidade -> ativa (blue/green) só se aprovado. Espelha `run_transform_pipeline`
+    (BR), mas o join unidade legal <-> estabelecimento já acontece dentro de
+    `materialize_leads_fr` (em Python, não via tabelas de staging DuckDB
+    pré-carregadas — ver docstring de lá) — por isso não recebe uma `con` com
+    staging já montado; `con` aqui só serve pra `run_quality_checks` (uma conexão
+    `:memory:` própria é aberta e fechada automaticamente se nenhuma for passada).
+
+    A versão nova parte de uma cópia das partições de OUTRAS fontes (ex.: `pais=BR`)
+    da versão hoje ativa (ver `copy_forward_active_version`) — mesma razão do lado
+    BR: só `pais=FR` é (re)materializado aqui, e BR/FR são agendados de forma
+    independente (ver `src/scheduler/`).
+
+    Args:
+        unite_legale_files/etablissement_files: arquivos de stock SIRENE já
+            baixados (ver `ingestion/fr_sirene/stock_download.py`).
+        warehouse_dir: raiz do warehouse.
+        con: conexão DuckDB pra `run_quality_checks`; default: `:memory:` própria.
+        batch_size: linhas por lote/arquivo Parquet (ver `materialize_leads_fr`).
+        thresholds: limites de qualidade; default: `QualityThresholds()`.
+
+    Returns:
+        `PipelineResult` — mesmo formato de `run_transform_pipeline`.
+    """
+    version_dir = new_version_dir(warehouse_dir)
+    copy_forward_active_version(warehouse_dir, version_dir, exclude_pais="FR")
+    materialize_result = materialize_leads_fr(
+        unite_legale_files, etablissement_files, version_dir, batch_size=batch_size
+    )
+
+    owns_con = con is None
+    con = con or duckdb.connect(":memory:")
+    try:
+        quality_report = run_quality_checks(con, version_dir, thresholds=thresholds)
+    finally:
+        if owns_con:
+            con.close()
 
     activated = False
     if quality_report.passed:
