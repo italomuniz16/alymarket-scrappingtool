@@ -93,8 +93,18 @@ _CUSTOM_CSS = f"""
 }}
 
 .block-container {{
-    padding-top: 2rem;
-    max-width: 1200px;
+    /* Antes: `max-width: 1200px` centralizava o conteúdo numa coluna estreita
+       em telas largas, deixando uma faixa clara de sobra visível dos dois
+       lados (o fundo claro do tema, `--am-page`, por trás) -- removido: com
+       `layout="wide"` (já configurado), o conteúdo ocupa a largura toda.
+       Isso sozinho não bastava: mesmo em `layout="wide"`, o Streamlit ainda
+       aplica um padding padrão de fábrica (`96px/80px/160px` em cima/lados/
+       embaixo) no `.block-container` -- sobrava como moldura clara visível
+       nas laterais e embaixo. Reduzido pra um respiro modesto e simétrico
+       (widgets nativos do Streamlit ainda precisam de alguma margem da
+       borda pra não parecer quebrado, mas nada como os valores de fábrica). */
+    padding: 1.25rem 1.5rem 2rem !important;
+    max-width: 100% !important;
 }}
 
 h1 {{
