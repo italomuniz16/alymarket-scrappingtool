@@ -30,6 +30,27 @@ DEFAULT_DIST_INDEX = _REPO_ROOT / "frontend" / "dist" / "index.html"
 def main() -> None:
     st.set_page_config(page_title="alymarket — leads", layout="wide")
 
+    # `layout="wide"` só zera a margem lateral EXTRA que o layout centralizado
+    # aplicaria -- o `.block-container` padrão do Streamlit ainda reserva
+    # ~96px em cima / ~80px nas laterais / ~160px embaixo em volta de todo o
+    # conteúdo principal, o que sobra como uma moldura clara ao redor do
+    # iframe (o React já tem seu próprio `bg-background` de borda a borda por
+    # dentro). Zeramos esse padding especificamente pra essa página -- não
+    # afeta `src/dashboard/app.py` (outro processo de rerun, CSS não vaza
+    # entre eles) nem a barra de ferramentas do Streamlit Cloud (Share/Manage
+    # app), que vive fora do `.block-container`.
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stMainBlockContainer"] {
+            padding: 0 !important;
+            max-width: 100% !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     dist_index = Path(os.environ.get("FRONTEND_DIST_INDEX", str(DEFAULT_DIST_INDEX)))
 
     if not dist_index.is_file():
