@@ -37,13 +37,21 @@ def main() -> None:
     # iframe (o React já tem seu próprio `bg-background` de borda a borda por
     # dentro). Zeramos esse padding especificamente pra essa página -- não
     # afeta `src/dashboard/app.py` (outro processo de rerun, CSS não vaza
-    # entre eles) nem a barra de ferramentas do Streamlit Cloud (Share/Manage
-    # app), que vive fora do `.block-container`.
+    # entre eles).
+    #
+    # Cuidado: NÃO zerar o padding-top por completo -- `header[data-testid=
+    # "stHeader"]` (a barra fixa "Share/★/✎/GitHub/⋮" do Streamlit Cloud) é
+    # `position: absolute`, `z-index: 999990`, 60px de altura, cobrindo o
+    # topo da página por cima de tudo. Com padding-top 0, nosso iframe (e o
+    # header sticky do React lá dentro, com a logo) nascia debaixo dela --
+    # ficava escondido atrás da barra do Streamlit em vez de abaixo dela.
+    # 64px (60px da barra + pequena folga) evita a sobreposição mantendo o
+    # resto do padding zerado.
     st.markdown(
         """
         <style>
         div[data-testid="stMainBlockContainer"] {
-            padding: 0 !important;
+            padding: 64px 0 0 0 !important;
             max-width: 100% !important;
         }
         </style>
