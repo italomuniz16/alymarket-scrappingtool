@@ -1,0 +1,30 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+# `dist/index.html` é o build singlefile autocontido (JS/CSS/assets inline via
+# vite-plugin-singlefile) que o Streamlit Cloud embute (ver
+# src/dashboard/react_embed.py) -- ele PRECISA estar commitado, já que o
+# Streamlit Cloud não roda `npm run build`. Gerar e commitar a cada release do
+# frontend (passo manual).
+dist/*
+!dist/index.html
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

@@ -7,13 +7,14 @@ data/exports/
 # Segredos
 .env
 
-# Python
+# Python (ancorado na raiz -- não confundir com frontend/dist/, que tem regra
+# própria em frontend/.gitignore pra permitir frontend/dist/index.html)
 __pycache__/
 *.py[cod]
 *.egg-info/
 .eggs/
-build/
-dist/
+/build/
+/dist/
 .venv/
 venv/
 
