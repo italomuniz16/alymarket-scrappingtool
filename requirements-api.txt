@@ -1,0 +1,16 @@
+# Dependências da API (src/api/app.py), hospedada separadamente do dashboard
+# Streamlit (ver requirements.txt na raiz -- esse aqui é só pro deploy da API, ex.:
+# Render). Gerado a partir do grafo de imports real de src/api/app.py ->
+# src/dashboard/data.py -> scheduler/pipelines.py -> ingestion/br_opencnpj/* (mesma
+# disciplina do requirements.txt do dashboard: não é pip freeze).
+#
+# Pins soltos (>=), sem pacotes específicos de SO (o host é Linux).
+
+fastapi>=0.110
+uvicorn[standard]>=0.29
+duckdb>=1.0
+polars>=1.0
+pydantic>=2.7
+openpyxl>=3.1
+httpx>=0.27
+tenacity>=8.2
