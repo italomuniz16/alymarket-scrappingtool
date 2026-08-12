@@ -46,15 +46,57 @@ def main() -> None:
     # absolute`, 60px, `z-index: 999990`) obrigava a reservar espaço em cima
     # só pra não tampar nosso conteúdo. Com ela escondida, volta a fazer
     # sentido zerar o padding-top também -- nada mais reserva aquele espaço.
+    #
+    # Três sobras finas continuavam aparecendo mesmo com o padding zerado
+    # (cada uma com uma causa diferente, todas confirmadas inspecionando o
+    # box model ao vivo -- ver histórico do commit):
+    # 1. `[data-testid="stVerticalBlock"]` é `display:flex; gap:16px`. Este
+    #    próprio `st.markdown(...)` (que só injeta um `<style>`, sem saída
+    #    visível) também vira um item de layout ali -- um
+    #    `stElementContainer` de altura 0 antes do nosso iframe. O `gap`
+    #    do flex conta a fronteira entre os dois itens mesmo o primeiro
+    #    tendo altura zero, empurrando o iframe 16px pra baixo. Como essa
+    #    página só tem esses dois itens (o style injetado e o iframe), zerar
+    #    o `gap` do bloco é seguro e não afeta espaçamento visível nenhum.
+    # 2. `[data-testid="stIFrame"]` (o próprio `<iframe>`) também tem
+    #    `margin: 0 auto 16px` por padrão do Streamlit -- zerado.
+    # 3. `[data-testid="stMain"]` tem `overflow-y: auto`: como o iframe é
+    #    mais alto que a viewport, a PÁGINA do Streamlit também precisa
+    #    rolar, e isso reserva ~10px de canaleta de scrollbar nativa na
+    #    lateral, expondo o fundo claro do tema Streamlit (`.streamlit/
+    #    config.toml`) por trás -- não dava pra "casar a cor" porque o tema
+    #    do React é dinâmico (claro/escuro, depende do usuário). Em vez
+    #    disso, o iframe passa a ocupar exatamente `100vh` (via CSS,
+    #    sobrepondo o atributo `height` fixo que o Streamlit aplica) e
+    #    `stMain` ganha `overflow: hidden` -- a PÁGINA do Streamlit nunca
+    #    mais rola; só o iframe rola por dentro (`scrolling=True`, já
+    #    configurado), com sua própria barra de rolagem dentro do tema
+    #    React, sem expor nada por trás.
+    #
+    # Seletores sem qualificador de tag (`[data-testid=...]`, não
+    # `div[data-testid=...]`) de propósito -- `stMain` por exemplo é uma
+    # `<section>`, não uma `<div>`; qualificar a tag errada faz a regra CSS
+    # simplesmente não bater com nada, silenciosamente.
     st.markdown(
         """
         <style>
-        div[data-testid="stMainBlockContainer"] {
+        [data-testid="stMainBlockContainer"] {
             padding: 0 !important;
             max-width: 100% !important;
         }
-        header[data-testid="stHeader"] {
+        [data-testid="stHeader"] {
             display: none !important;
+        }
+        [data-testid="stMain"] {
+            overflow: hidden !important;
+        }
+        [data-testid="stVerticalBlock"] {
+            gap: 0 !important;
+        }
+        [data-testid="stIFrame"] {
+            margin: 0 !important;
+            display: block !important;
+            height: 100vh !important;
         }
         </style>
         """,
@@ -76,11 +118,12 @@ def main() -> None:
         return
 
     html = dist_index.read_text(encoding="utf-8")
-    # Altura grande e fixa (não há como o iframe se auto-ajustar ao conteúdo sem
-    # JS extra de postMessage, que o build não implementa) -- 1800px cobre o
-    # layout completo (filtros + KPIs + scheduler + tabela + gráficos +
-    # compliance) sem scroll duplo na maioria das telas; `scrolling=True` cobre
-    # o resto.
+    # `height=1800` é só o atributo HTML de fallback -- o CSS acima sobrepõe
+    # pra `100vh` de verdade (não há como o iframe se auto-ajustar ao
+    # conteúdo sem JS extra de postMessage, que o build não implementa; fixar
+    # em `100vh` em vez de um pixel fixo é o que faz a página do Streamlit
+    # nunca precisar rolar, ver comentário acima). `scrolling=True` deixa o
+    # iframe rolar por dentro pro conteúdo que não cabe na tela.
     st.components.v1.html(html, height=1800, scrolling=True)
 
 
