@@ -39,20 +39,22 @@ def main() -> None:
     # afeta `src/dashboard/app.py` (outro processo de rerun, CSS não vaza
     # entre eles).
     #
-    # Cuidado: NÃO zerar o padding-top por completo -- `header[data-testid=
-    # "stHeader"]` (a barra fixa "Share/★/✎/GitHub/⋮" do Streamlit Cloud) é
-    # `position: absolute`, `z-index: 999990`, 60px de altura, cobrindo o
-    # topo da página por cima de tudo. Com padding-top 0, nosso iframe (e o
-    # header sticky do React lá dentro, com a logo) nascia debaixo dela --
-    # ficava escondido atrás da barra do Streamlit em vez de abaixo dela.
-    # 64px (60px da barra + pequena folga) evita a sobreposição mantendo o
-    # resto do padding zerado.
+    # `header[data-testid="stHeader"]` (a barra "Share/★/✎/GitHub/⋮" do
+    # Streamlit Cloud) fica oculta por completo (`display: none`) -- essa
+    # página já tem seu próprio header (a logo/marca do React lá dentro), a
+    # barra do Streamlit por cima só duplicava chrome e (como era `position:
+    # absolute`, 60px, `z-index: 999990`) obrigava a reservar espaço em cima
+    # só pra não tampar nosso conteúdo. Com ela escondida, volta a fazer
+    # sentido zerar o padding-top também -- nada mais reserva aquele espaço.
     st.markdown(
         """
         <style>
         div[data-testid="stMainBlockContainer"] {
-            padding: 64px 0 0 0 !important;
+            padding: 0 !important;
             max-width: 100% !important;
+        }
+        header[data-testid="stHeader"] {
+            display: none !important;
         }
         </style>
         """,
